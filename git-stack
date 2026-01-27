@@ -1,0 +1,1623 @@
+#!/usr/bin/env python3
+"""
+Git stacked branches management tool.
+
+Supported commands:
+  git stack ls|list                # List stacked branches and their status
+  git stack create <branch>        # Create a new stacked branch from current branch
+  git stack adopt <branch> [base]  # Tag existing branch as stacked on base (default: current branch)
+  git stack set-parent <base>      # Set the parent/base of the current branch
+  git stack base [new-base]        # Show or change the base of current stacked branch
+  git stack sync1                  # Sync current branch with its immediate upstream
+  git stack sync-up                # Sync current branch with all its upstreams (recursive)
+  git stack sync-deps              # Sync only dependencies of the current branch (not current)
+  git stack sync-all               # Sync all stacked branches in the repository
+  git stack continue               # Continue sync after resolving conflicts
+  git stack abort                  # Abort current rebase, continue with remaining branches
+  git stack abort-all              # Abort and restore all branches to original state
+  git stack push                   # Push current stacked branch to remote
+  git stack push-all               # Push all stacked branches to remote
+  git stack push-remotes           # Push only branches that have remote tracking
+  git stack delete <branch>        # Delete a stacked branch and update dependents
+  git stack rename [<old>] <new>   # Rename a stacked branch and update all references
+  git stack rebase <new-base>      # Rebase current stack onto a new base
+  git stack log                    # Show log of commits in current stack
+  git stack diff                   # Show diff of current branch against its base
+
+Supported workflows:
+
+============================================================================
+USER JOURNEY 1: Creating a New Feature Stack
+============================================================================
+Start from main branch and create a series of dependent changes:
+
+  $ git checkout main
+  $ git stack create feature/step1
+  # ... make changes for step 1 ...
+  $ git commit -m "Step 1: Add base infrastructure"
+
+  $ git stack create feature/step2     # Creates step2 stacked on step1
+  # ... make changes for step 2 ...
+  $ git commit -m "Step 2: Add API layer"
+
+  $ git stack create feature/step3     # Creates step3 stacked on step2
+  # ... make changes for step 3 ...
+  $ git commit -m "Step 3: Add UI components"
+
+Result: main <- feature/step1 <- feature/step2 <- feature/step3
+
+============================================================================
+USER JOURNEY 2: Adopting Existing Branches into a Stack
+============================================================================
+You have existing branches that you want to organize as a stack:
+
+  $ git checkout feature/api-refactor
+  $ git stack adopt feature/api-refactor main
+  # Now feature/api-refactor is marked as stacked on main
+
+  $ git checkout feature/api-tests
+  $ git stack adopt feature/api-tests feature/api-refactor
+  # Now feature/api-tests is marked as stacked on feature/api-refactor
+
+Alternative (adopt current branch):
+  $ git checkout feature/api-tests
+  $ git stack adopt . feature/api-refactor
+
+============================================================================
+USER JOURNEY 3: Syncing After Upstream Changes
+============================================================================
+When main branch or a base branch gets updated:
+
+Scenario A: Update just the current branch from its immediate parent:
+  $ git checkout feature/step2
+  $ git stack sync1
+  # Rebases step2 onto the latest step1
+
+Scenario B: Recursively sync current branch (sync all ancestors first):
+  $ git checkout feature/step3
+  $ git stack sync-up
+  # First syncs step1 onto main, then step2 onto step1, then step3 onto step2
+
+Scenario C: Sync only the dependencies (not the current branch):
+  $ git checkout feature/step3
+  $ git stack sync-deps
+  # Syncs step1 and step2, but leaves step3 as-is
+
+Scenario D: Sync all stacked branches in the repo:
+  $ git stack sync-all
+  # Finds all stacked branches and syncs them in dependency order
+
+============================================================================
+USER JOURNEY 4: Nested Stacks (Stack on Stack)
+============================================================================
+Create a sub-feature that branches off another stacked branch:
+
+  $ git checkout feature/step2
+  $ git stack create feature/step2-hotfix
+  # ... make hotfix changes ...
+  $ git commit -m "Hotfix for step 2"
+
+Result: main <- step1 <- step2 <- step2-hotfix
+                             \\<- step3
+
+Both step2-hotfix and step3 are based on step2. When step2 is updated:
+  $ git checkout feature/step2
+  # ... make changes ...
+  $ git commit -m "Update step 2"
+  $ git stack sync-all
+  # Both step2-hotfix and step3 get rebased onto the new step2
+
+============================================================================
+USER JOURNEY 5: Changing the Base of a Stack
+============================================================================
+Move a stacked branch to a different base:
+
+  $ git checkout feature/step3
+  $ git stack base
+  # Shows: feature/step2
+
+  $ git stack base feature/step1
+  # Rebases step3 onto step1 instead of step2
+
+  $ git stack rebase main
+  # Rebases step3 directly onto main, removing it from the stack
+
+============================================================================
+USER JOURNEY 6: Reviewing and Pushing Stacks
+============================================================================
+View the current stack structure:
+  $ git stack ls
+  # Output:
+  #   main
+  #   └── feature/step1 (2 commits ahead)
+  #       └── feature/step2 (1 commit ahead)
+  #           ├── feature/step2-hotfix (1 commit ahead)
+  #           └── feature/step3 (3 commits ahead)
+
+View commits in the current stacked branch:
+  $ git checkout feature/step2
+  $ git stack log
+  # Shows commits in step2 that are not in step1
+
+View diff against base:
+  $ git stack diff
+  # Shows diff between step2 and step1
+
+Push all branches in the stack:
+  $ git stack push-all
+  # Pushes step1, step2, step3, etc. to remote
+
+============================================================================
+USER JOURNEY 7: Completing and Cleaning Up a Stack
+============================================================================
+After feature/step1 is merged to main:
+
+  $ git checkout main
+  $ git pull
+  $ git stack delete feature/step1
+  # Deletes step1 and updates step2's base to point to main
+  # Then triggers sync to rebase step2 and its dependents onto main
+
+Or manually update the base:
+  $ git checkout feature/step2
+  $ git stack base main
+  $ git stack sync-up
+
+============================================================================
+METADATA STORAGE
+============================================================================
+Stack relationships are stored in git config:
+  git config branch.<branch>.stackbase <base-branch>
+
+Example:
+  git config branch.feature/step2.stackbase feature/step1
+
+============================================================================
+DEVELOPMENT
+============================================================================
+
+Check syntax with:
+  python3 -m py_compile /Users/y.ershov/bin/git-stack && echo "Syntax OK"
+
+============================================================================
+"""
+
+import os
+import sys
+import subprocess
+import re
+import shutil
+import json
+from pathlib import Path
+from collections import defaultdict
+from typing import Optional, List, Dict, Tuple
+
+
+# ============================================================================
+# Git Helper Functions
+# ============================================================================
+
+def git(*args: str, check: bool = True, capture: bool = True) -> Tuple[int, str, str]:
+    """Run a git command and return (returncode, stdout, stderr)."""
+    cmd = ['git'] + list(args)
+    result = subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        if capture:
+            sys.stderr.write(result.stderr)
+        raise SystemExit(result.returncode)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def git_output(*args: str, check: bool = True) -> str:
+    """Run a git command and return stdout."""
+    _, stdout, _ = git(*args, check=check)
+    return stdout
+
+
+def git_run(*args: str) -> int:
+    """Run a git command with output to terminal, return exit code."""
+    result = subprocess.run(['git'] + list(args))
+    return result.returncode
+
+
+def get_git_root() -> Path:
+    """Get the root directory of the git repository."""
+    return Path(git_output('rev-parse', '--show-toplevel'))
+
+
+def get_current_branch() -> str:
+    """Get the name of the current branch."""
+    return git_output('rev-parse', '--abbrev-ref', 'HEAD')
+
+
+def is_rebase_in_progress(git_root: Path) -> bool:
+    """Check if a rebase is currently in progress."""
+    return (git_root / '.git' / 'rebase-merge').is_dir() or \
+           (git_root / '.git' / 'rebase-apply').is_dir()
+
+
+# ============================================================================
+# Stack Base Management (git config)
+# ============================================================================
+
+def get_stack_base(branch: Optional[str] = None) -> Optional[str]:
+    """Get the stack base for a branch."""
+    if branch is None:
+        branch = get_current_branch()
+    code, stdout, _ = git('config', '--get', f'branch.{branch}.stackbase', check=False)
+    return stdout if code == 0 and stdout else None
+
+
+def set_stack_base(branch: str, base: str) -> None:
+    """Set the stack base for a branch."""
+    git('config', f'branch.{branch}.stackbase', base)
+
+
+def remove_stack_base(branch: str) -> None:
+    """Remove the stack base for a branch."""
+    git('config', '--unset', f'branch.{branch}.stackbase', check=False)
+
+
+def get_all_stack_relationships() -> Dict[str, str]:
+    """Get all branch -> base relationships."""
+    code, stdout, _ = git('config', '--get-regexp', r'^branch\..*\.stackbase$', check=False)
+    if code != 0 or not stdout:
+        return {}
+
+    relationships = {}
+    for line in stdout.splitlines():
+        # Format: branch.<name>.stackbase <base>
+        match = re.match(r'^branch\.(.+)\.stackbase\s+(.+)$', line)
+        if match:
+            branch, base = match.groups()
+            relationships[branch] = base
+    return relationships
+
+
+def get_all_stacked_branches() -> List[str]:
+    """Get list of all stacked branches."""
+    return list(get_all_stack_relationships().keys())
+
+
+def get_dependents(base: str) -> List[str]:
+    """Get all branches that depend on the given base."""
+    relationships = get_all_stack_relationships()
+    return [branch for branch, b in relationships.items() if b == base]
+
+
+# ============================================================================
+# Topological Sort for Dependency Order
+# ============================================================================
+
+def get_branches_in_dependency_order(target_branch: Optional[str] = None) -> List[str]:
+    """
+    Get all stacked branches in topological order (dependencies first).
+    If target_branch is specified, only return ancestors of that branch (including itself).
+    """
+    relationships = get_all_stack_relationships()
+    if not relationships:
+        return []
+
+    # Build parent and children maps
+    parent = relationships  # child -> parent
+    children: Dict[str, List[str]] = defaultdict(list)
+    for child, par in parent.items():
+        children[par].append(child)
+
+    # If target specified, find all ancestors
+    ancestors = set()
+    if target_branch:
+        current = target_branch
+        while current in parent:
+            ancestors.add(current)
+            current = parent[current]
+
+    # Topological sort using Kahn's algorithm
+    all_branches = list(parent.keys())
+
+    # Calculate in-degree (only count edges within stacked branches)
+    in_degree: Dict[str, int] = defaultdict(int)
+    for branch in all_branches:
+        base = parent[branch]
+        if base in parent:
+            # base is also a stacked branch, so this edge counts
+            in_degree[branch] += 1
+
+    # Find branches with no stacked dependencies
+    queue = sorted([b for b in all_branches if in_degree[b] == 0])
+
+    result = []
+    while queue:
+        branch = queue.pop(0)
+
+        # Add to result if no target or if it's an ancestor of target
+        if not target_branch or branch in ancestors:
+            result.append(branch)
+
+        # Decrease in-degree of children
+        for child in sorted(children.get(branch, [])):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+        queue.sort()  # Keep deterministic order
+
+    return result
+
+
+# ============================================================================
+# Sync State Management
+# ============================================================================
+
+class SyncState:
+    """Manages the state of an in-progress sync operation."""
+
+    def __init__(self, git_root: Path):
+        self.state_dir = git_root / '.git' / 'stack-sync-state'
+
+    def in_progress(self) -> bool:
+        """Check if a sync is in progress."""
+        return self.state_dir.is_dir()
+
+    def init(self, original_branch: str, branches: List[str], new_base: Optional[str] = None) -> None:
+        """Initialize sync state."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+        (self.state_dir / 'original_branch').write_text(original_branch)
+        (self.state_dir / 'branches_to_sync').write_text('\n'.join(branches))
+        (self.state_dir / 'branches_completed').write_text('')
+
+        # Save new_base for rebase command (optional)
+        if new_base:
+            (self.state_dir / 'new_base').write_text(new_base)
+
+        # Save original refs for abort-all
+        refs = []
+        for branch in branches:
+            ref = git_output('rev-parse', branch)
+            refs.append(f'{branch} {ref}')
+        (self.state_dir / 'original_refs').write_text('\n'.join(refs))
+
+    def get_branches_to_sync(self) -> List[str]:
+        """Get all branches that need to be synced."""
+        path = self.state_dir / 'branches_to_sync'
+        if not path.exists():
+            return []
+        return [b for b in path.read_text().splitlines() if b]
+
+    def get_completed_branches(self) -> List[str]:
+        """Get branches that have been completed."""
+        path = self.state_dir / 'branches_completed'
+        if not path.exists():
+            return []
+        return [b for b in path.read_text().splitlines() if b]
+
+    def get_remaining_branches(self) -> List[str]:
+        """Get branches that still need to be synced."""
+        to_sync = self.get_branches_to_sync()
+        completed = set(self.get_completed_branches())
+        return [b for b in to_sync if b not in completed]
+
+    def get_current_sync_branch(self) -> Optional[str]:
+        """Get the first remaining branch."""
+        remaining = self.get_remaining_branches()
+        return remaining[0] if remaining else None
+
+    def mark_completed(self, branch: str) -> None:
+        """Mark a branch as completed."""
+        path = self.state_dir / 'branches_completed'
+        with open(path, 'a') as f:
+            f.write(branch + '\n')
+
+    def get_original_branch(self) -> Optional[str]:
+        """Get the original branch before sync started."""
+        path = self.state_dir / 'original_branch'
+        if not path.exists():
+            return None
+        return path.read_text().strip()
+
+    def get_new_base(self) -> Optional[str]:
+        """Get the new base for rebase operation (if any)."""
+        path = self.state_dir / 'new_base'
+        if not path.exists():
+            return None
+        return path.read_text().strip()
+
+    def get_original_refs(self) -> Dict[str, str]:
+        """Get original refs for all branches."""
+        path = self.state_dir / 'original_refs'
+        if not path.exists():
+            return {}
+        refs = {}
+        for line in path.read_text().splitlines():
+            if ' ' in line:
+                branch, ref = line.split(' ', 1)
+                refs[branch] = ref
+        return refs
+
+    def restore_original_refs(self) -> None:
+        """Restore all branches to their original refs."""
+        for branch, ref in self.get_original_refs().items():
+            print(f"Restoring '{branch}' to {ref}...")
+            git('checkout', branch, check=False)
+            git('reset', '--hard', ref)
+
+    def cleanup(self) -> None:
+        """Remove sync state."""
+        if self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+
+
+def check_no_sync_in_progress(state: SyncState) -> None:
+    """Check that no sync is in progress, exit with error if one is."""
+    if state.in_progress():
+        print("Error: A sync operation is in progress.")
+        print()
+        print("Use one of the following commands:")
+        print("  git stack continue      - Continue the sync after resolving conflicts")
+        print("  git stack abort         - Abort the current rebase and continue with remaining branches")
+        print("  git stack abort-all     - Abort and restore all branches to their original state")
+        print()
+        print("Remaining branches to sync:")
+        for branch in state.get_remaining_branches():
+            print(f"  {branch}")
+        sys.exit(1)
+
+
+def sync_single_branch(branch: str, state: SyncState, git_root: Path) -> bool:
+    """
+    Sync a single branch onto its base.
+    Returns True on success, False on failure.
+    """
+    base = get_stack_base(branch)
+    if not base:
+        print(f"Error: '{branch}' has no stack base")
+        return False
+
+    print(f"Syncing '{branch}' onto '{base}'...")
+    git('checkout', branch)
+
+    fork_point = git_output('merge-base', branch, base)
+
+    code = git_run('rebase', '--onto', base, fork_point, branch)
+    if code == 0:
+        state.mark_completed(branch)
+        return True
+    else:
+        # If rebase failed but nothing is in progress, clean up state
+        if not is_rebase_in_progress(git_root) and not state.get_completed_branches():
+            state.cleanup()
+            print()
+            print(f"Rebase failed for '{branch}'.")
+        else:
+            print()
+            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
+            print("  git stack continue      - Continue after resolving conflicts")
+            print("  git stack abort         - Abort this rebase and skip to next branch")
+            print("  git stack abort-all     - Abort and restore all branches")
+        return False
+
+
+def rebase_onto_new_base(branch: str, new_base: str, old_base: Optional[str], state: SyncState, git_root: Path) -> bool:
+    """
+    Rebase a branch onto a new base (different from its stack base).
+    If old_base is None, uses merge-base with new_base as fork point.
+    Returns True on success, False on failure.
+    """
+    print(f"Rebasing '{branch}' onto '{new_base}'...")
+    git('checkout', branch)
+
+    # Determine fork point
+    if old_base:
+        fork_point = git_output('merge-base', branch, old_base)
+    else:
+        fork_point = git_output('merge-base', branch, new_base)
+
+    code = git_run('rebase', '--onto', new_base, fork_point, branch)
+    if code == 0:
+        set_stack_base(branch, new_base)
+        state.mark_completed(branch)
+        return True
+    else:
+        # If rebase failed but nothing is in progress, clean up state
+        if not is_rebase_in_progress(git_root) and not state.get_completed_branches():
+            state.cleanup()
+            print()
+            print(f"Rebase failed for '{branch}'.")
+        else:
+            print()
+            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
+            print("  git stack continue      - Continue after resolving conflicts")
+            print("  git stack abort         - Abort this rebase and restore original state")
+            print("  git stack abort-all     - Abort and restore all branches")
+        return False
+
+
+# ============================================================================
+# Tree Display for `ls` command
+# ============================================================================
+
+def get_commits_ahead(branch: str, base: str) -> int:
+    """Get number of commits branch is ahead of base."""
+    code, stdout, _ = git('rev-list', '--count', f'{base}..{branch}', check=False)
+    if code == 0 and stdout:
+        try:
+            return int(stdout)
+        except ValueError:
+            pass
+    return 0
+
+
+def get_sync_status(branch: str, base: str) -> str:
+    """Check if branch is synced with base."""
+    merge_base = git_output('merge-base', branch, base, check=False)
+    base_head = git_output('rev-parse', base, check=False)
+    return "synced" if merge_base == base_head else "needs sync"
+
+
+def get_remote_status(branch: str) -> Optional[Tuple[str, str]]:
+    """
+    Get remote tracking status for a branch.
+    Returns (upstream_name, status_string) or None if no upstream.
+    """
+    # Get the upstream tracking branch
+    code, upstream, _ = git('rev-parse', '--abbrev-ref', f'{branch}@{{upstream}}', check=False)
+    if code != 0 or not upstream:
+        return None
+
+    # Get ahead/behind counts
+    code, stdout, _ = git('rev-list', '--left-right', '--count', f'{branch}...{upstream}', check=False)
+    if code != 0 or not stdout:
+        return (upstream, "?")
+
+    parts = stdout.split()
+    if len(parts) != 2:
+        return (upstream, "?")
+
+    ahead, behind = int(parts[0]), int(parts[1])
+
+    if ahead == 0 and behind == 0:
+        return (upstream, "")
+    elif ahead > 0 and behind == 0:
+        return (upstream, f"{ahead} ahead")
+    elif ahead == 0 and behind > 0:
+        return (upstream, f"{behind} behind")
+    else:
+        return (upstream, f"{ahead} ahead, {behind} behind")
+
+
+def print_tree(state: Optional[SyncState] = None) -> None:
+    """Print stacked branches as a tree."""
+    relationships = get_all_stack_relationships()
+    if not relationships:
+        print("No stacked branches found.")
+        return
+
+    current_branch = get_current_branch()
+
+    # Get sync state info if available
+    sync_in_progress = state and state.in_progress()
+    completed_branches = set(state.get_completed_branches()) if sync_in_progress else set()
+    remaining_branches = state.get_remaining_branches() if sync_in_progress else []
+    current_sync_branch = remaining_branches[0] if remaining_branches else None
+
+    # Show sync status header if in progress
+    if sync_in_progress:
+        new_base = state.get_new_base()
+        if new_base:
+            print(f"[Rebase onto '{new_base}' in progress]")
+        else:
+            print("[Sync in progress]")
+        print()
+
+    # Build children map
+    children: Dict[str, List[str]] = defaultdict(list)
+    all_bases = set()
+    for branch, base in relationships.items():
+        children[base].append(branch)
+        all_bases.add(base)
+
+    # Find roots (bases that are not stacked themselves)
+    roots = sorted([base for base in all_bases if base not in relationships])
+
+    def print_branch(branch: str, prefix: str, is_last: bool, is_root: bool) -> None:
+        connector = "" if is_root else ("└── " if is_last else "├── ")
+        # marker = "* " if branch == current_branch else "· "
+        marker = "* " if branch == current_branch else "  "
+
+        # Get status info
+        status_parts = []
+
+        # Add sync operation status if in progress
+        if sync_in_progress:
+            if branch == current_sync_branch:
+                status_parts.append("REBASING")
+            elif branch in completed_branches:
+                status_parts.append("done")
+            elif branch in remaining_branches:
+                status_parts.append("pending")
+
+        if branch in relationships:
+            base = relationships[branch]
+            ahead = get_commits_ahead(branch, base)
+            sync = get_sync_status(branch, base)
+            status_parts.append(f"{ahead} ahead")
+            if sync == "needs sync":
+                status_parts.append(sync)
+
+        # Get remote tracking status
+        remote_info = get_remote_status(branch)
+        if remote_info:
+            upstream, remote_status = remote_info
+            status_parts.append(f"{upstream} {remote_status}")
+
+        status = f" ({', '.join(status_parts)})" if status_parts else ""
+
+        print(f"{marker}{prefix}{connector}{branch}{status}")
+
+        kids = sorted(children.get(branch, []))
+        new_prefix = "" if is_root else prefix + ("    " if is_last else "│   ")
+
+        for i, kid in enumerate(kids):
+            print_branch(kid, new_prefix, i == len(kids) - 1, False)
+
+    for root in roots:
+        print_branch(root, "", True, True)
+
+
+# ============================================================================
+# Command Implementations
+# ============================================================================
+
+def cmd_help() -> None:
+    """Show help message."""
+    print("Usage: git stack [command] [args]")
+    print()
+    print("Commands:")
+    print("  ls, list, st, status    List stacked branches and their status (default command)")
+    print("  cr, create <branch>     Create a new stacked branch from current branch")
+    print("  ad, adopt <br> [base]   Tag existing branch as stacked on base")
+    print("  sp, set-parent [b] <p>  Set the parent/base of a branch (default: current)")
+    print("  sb, set-base [b] <p>    Set the parent/base of a branch (default: current)")
+    print("  b,  base [new-base]     Show or change the base of current branch")
+    print()
+    print("Sync commands:")
+    print("  s1, sync1               Sync current branch with its immediate upstream")
+    print("  su, sync-up             Sync current branch with all its upstreams")
+    print("  sd, sync-deps           Sync only dependencies of the current branch")
+    print("  sa, sync-all            Sync all stacked branches")
+    print("  c, continue             Continue sync after resolving conflicts")
+    print("  ab, abort               Abort current rebase, continue with remaining")
+    print("  aa, abort-all           Abort and restore all branches to original state")
+    print("  rr, rebase-reset        Clear rebase state without restoring branches")
+    print()
+    print("Other commands:")
+    print("  p,  push                Push current stacked branch to remote")
+    print("  pa, push-all            Push all stacked branches to remote")
+    print("  pr, push-remotes        Push only branches that have remote tracking")
+    print("                          (use --force or --force-with-lease)")
+    print("  d,  delete <branch>     Delete a stacked branch and update dependents")
+    print("  rn, rename [<old>] <n>  Rename branch (current if old not specified)")
+    print("  spl, split <br> [p] [c] Split commit into new branch between parent/child")
+    print("  rb, rebase <new-base>   Rebase current stack onto a new base")
+    print("  l,  log                 Show log of commits in current stack")
+    print("  df, diff                Show diff of current branch against its base")
+    print("  h,  help                Show this help message")
+    print()
+    print("Import/Export commands:")
+    print("  export [file]           Export stack config to JSON (default: stdout)")
+    print("  import <file>           Import stack config from JSON (replaces existing)")
+    print("  import-update <file>    Import stack config (merges with existing)")
+    print("  zap                     Remove all stack configuration from repo")
+
+
+def cmd_ls(state: SyncState) -> None:
+    """List stacked branches as a tree."""
+    print_tree(state)
+
+
+def cmd_create(args: List[str]) -> None:
+    """Create a new stacked branch."""
+    if not args:
+        print("Error: Branch name required")
+        print("Usage: git stack create <branch>")
+        sys.exit(1)
+
+    new_branch = args[0]
+    current = get_current_branch()
+
+    git('checkout', '-b', new_branch)
+    set_stack_base(new_branch, current)
+    print(f"Created stacked branch '{new_branch}' based on '{current}'")
+
+
+def _set_branch_parent(branch: str, parent: str, action: str = "set parent") -> None:
+    """
+    Helper to set the parent/base of a branch with validation.
+
+    Args:
+        branch: The branch to modify (will be resolved if '.')
+        parent: The parent/base branch to set
+        action: Description for error/success messages ("adopt" or "set parent")
+    """
+    current = get_current_branch()
+
+    if branch == '.':
+        branch = current
+
+    # Validate that branch exists
+    code, _, _ = git('rev-parse', '--verify', branch, check=False)
+    if code != 0:
+        print(f"Error: Branch '{branch}' does not exist")
+        sys.exit(1)
+
+    # Validate that parent exists
+    code, _, _ = git('rev-parse', '--verify', parent, check=False)
+    if code != 0:
+        print(f"Error: Parent branch '{parent}' does not exist")
+        sys.exit(1)
+
+    # Prevent self-reference
+    if branch == parent:
+        print(f"Error: Cannot {action} a branch onto itself")
+        sys.exit(1)
+
+    old_parent = get_stack_base(branch)
+    set_stack_base(branch, parent)
+
+    if old_parent:
+        print(f"Changed parent of '{branch}' from '{old_parent}' to '{parent}'")
+    else:
+        print(f"Set parent of '{branch}' to '{parent}'")
+
+
+def cmd_adopt(args: List[str]) -> None:
+    """Adopt an existing branch as stacked."""
+    if not args:
+        print("Error: Branch name required")
+        print("Usage: git stack adopt <branch> [base]  # Adopt branch onto base (default: current)")
+        sys.exit(1)
+
+    current = get_current_branch()
+    branch = args[0]
+    base = args[1] if len(args) > 1 else current
+
+    _set_branch_parent(branch, base, action="adopt")
+
+
+def cmd_set_parent(args: List[str]) -> None:
+    """Set the parent/base of a branch."""
+    if not args:
+        print("Error: Parent branch required")
+        print("Usage: git stack set-parent <parent>              # Set parent of current branch")
+        print("       git stack set-parent <branch> <parent>     # Set parent of specified branch")
+        sys.exit(1)
+
+    current = get_current_branch()
+
+    # If one argument, set parent of current branch; if two, set parent of specified branch
+    if len(args) == 1:
+        branch = current
+        parent = args[0]
+    else:
+        branch = args[0]
+        parent = args[1]
+
+    _set_branch_parent(branch, parent, action="set parent")
+
+
+def cmd_base(args: List[str]) -> None:
+    """Show or change the base of current branch."""
+    current = get_current_branch()
+
+    if not args:
+        base = get_stack_base(current)
+        if base:
+            print(base)
+        else:
+            print("Current branch is not stacked")
+            sys.exit(1)
+    else:
+        new_base = args[0]
+        old_base = get_stack_base(current) or "(none)"
+        set_stack_base(current, new_base)
+        print(f"Changed base of '{current}' from '{old_base}' to '{new_base}'")
+
+
+def cmd_sync1(git_root: Path, state: SyncState) -> None:
+    """Sync current branch with its immediate upstream."""
+    check_no_sync_in_progress(state)
+
+    current = get_current_branch()
+    base = get_stack_base(current)
+
+    if not base:
+        print("Current branch is not stacked")
+        sys.exit(1)
+
+    # Use state management for continue/abort support
+    state.init(current, [current])
+
+    if not sync_single_branch(current, state, git_root):
+        sys.exit(1)
+
+    state.cleanup()
+    print("Sync complete.")
+
+
+def cmd_sync(git_root: Path, state: SyncState) -> None:
+    """Sync current branch with all its upstreams."""
+    check_no_sync_in_progress(state)
+
+    current = get_current_branch()
+    branches = get_branches_in_dependency_order(current)
+
+    if not branches:
+        print("Current branch is not stacked")
+        sys.exit(1)
+
+    state.init(current, branches)
+
+    for branch in branches:
+        if not sync_single_branch(branch, state, git_root):
+            sys.exit(1)
+
+    state.cleanup()
+    print("Sync complete.")
+
+
+def cmd_sync_deps(git_root: Path, state: SyncState) -> None:
+    """Sync only dependencies of current branch."""
+    check_no_sync_in_progress(state)
+
+    current = get_current_branch()
+    base = get_stack_base(current)
+
+    if not base:
+        print("Current branch is not stacked")
+        sys.exit(1)
+
+    # Get ancestors, excluding current branch
+    all_branches = get_branches_in_dependency_order(current)
+    branches = [b for b in all_branches if b != current]
+
+    if not branches:
+        print("No dependencies to sync.")
+        return
+
+    state.init(current, branches)
+
+    for branch in branches:
+        if not sync_single_branch(branch, state, git_root):
+            sys.exit(1)
+
+    state.cleanup()
+    git('checkout', current)
+    print("Sync complete.")
+
+
+def cmd_sync_all(git_root: Path, state: SyncState) -> None:
+    """Sync all stacked branches."""
+    check_no_sync_in_progress(state)
+
+    current = get_current_branch()
+    branches = get_branches_in_dependency_order()
+
+    if not branches:
+        print("No stacked branches to sync.")
+        return
+
+    state.init(current, branches)
+
+    for branch in branches:
+        if not sync_single_branch(branch, state, git_root):
+            sys.exit(1)
+
+    state.cleanup()
+    git('checkout', current)
+    print("Sync complete.")
+
+
+def cmd_continue(git_root: Path, state: SyncState) -> None:
+    """Continue sync after resolving conflicts."""
+    if not state.in_progress():
+        print("No sync operation in progress.")
+        sys.exit(1)
+
+    # Check if this is a rebase-onto-new-base operation
+    new_base = state.get_new_base()
+
+    # First, try to continue any in-progress rebase
+    if is_rebase_in_progress(git_root):
+        print("Continuing rebase...")
+        code = git_run('rebase', '--continue')
+        if code != 0:
+            print()
+            print("Rebase still has conflicts. Resolve them and run 'git stack continue' again.")
+            sys.exit(1)
+
+        # Mark current branch as completed
+        current_sync = state.get_current_sync_branch()
+        if current_sync:
+            # If this was a rebase onto new base, update the stack base
+            if new_base:
+                set_stack_base(current_sync, new_base)
+            state.mark_completed(current_sync)
+
+    # Continue with remaining branches
+    for branch in state.get_remaining_branches():
+        if new_base:
+            old_base = get_stack_base(branch)  # May be None for non-stacked
+            if not rebase_onto_new_base(branch, new_base, old_base, state, git_root):
+                sys.exit(1)
+        else:
+            if not sync_single_branch(branch, state, git_root):
+                sys.exit(1)
+
+    original = state.get_original_branch()
+    state.cleanup()
+    if original:
+        git('checkout', original)
+    print("Sync complete.")
+
+
+def cmd_abort(git_root: Path, state: SyncState) -> None:
+    """Abort current rebase, continue with remaining branches."""
+    if not state.in_progress():
+        print("No sync operation in progress.")
+        sys.exit(1)
+
+    # Abort current rebase if in progress
+    if is_rebase_in_progress(git_root):
+        print("Aborting current rebase...")
+        git('rebase', '--abort', check=False)
+
+    # Mark current branch as completed (skipped)
+    current_sync = state.get_current_sync_branch()
+    if current_sync:
+        print(f"Skipping '{current_sync}'...")
+        state.mark_completed(current_sync)
+
+    # Continue with remaining branches
+    remaining = state.get_remaining_branches()
+    if not remaining:
+        original = state.get_original_branch()
+        state.cleanup()
+        if original:
+            git('checkout', original)
+        print("Sync aborted. No remaining branches.")
+    else:
+        print("Continuing with remaining branches...")
+        for branch in remaining:
+            if not sync_single_branch(branch, state, git_root):
+                sys.exit(1)
+
+        original = state.get_original_branch()
+        state.cleanup()
+        if original:
+            git('checkout', original)
+        print("Sync complete (with some branches skipped).")
+
+
+def cmd_abort_all(git_root: Path, state: SyncState) -> None:
+    """Abort and restore all branches to original state."""
+    if not state.in_progress():
+        print("No sync operation in progress.")
+        sys.exit(1)
+
+    # Abort current rebase if in progress
+    if is_rebase_in_progress(git_root):
+        print("Aborting current rebase...")
+        git('rebase', '--abort', check=False)
+
+    print("Restoring all branches to original state...")
+    state.restore_original_refs()
+
+    original = state.get_original_branch()
+    state.cleanup()
+    if original:
+        git('checkout', original)
+    print("Sync aborted. All branches restored to original state.")
+
+
+def cmd_rebase_reset(git_root: Path, state: SyncState) -> None:
+    """Clear rebase state without restoring branches."""
+    if not state.in_progress():
+        print("No sync operation in progress.")
+        sys.exit(1)
+
+    # Abort current rebase if in progress
+    if is_rebase_in_progress(git_root):
+        print("Aborting current rebase...")
+        git('rebase', '--abort', check=False)
+
+    state.cleanup()
+    print("Rebase state cleared.")
+
+
+def cmd_push(args: List[str]) -> None:
+    """Push current stacked branch to remote."""
+    current = get_current_branch()
+    code = git_run('push', '-u', 'origin', current, *args)
+    sys.exit(code)
+
+
+def cmd_push_all(args: List[str]) -> None:
+    """Push all stacked branches to remote."""
+    branches = get_all_stacked_branches()
+    if not branches:
+        print("No stacked branches to push.")
+        return
+
+    code = git_run('push', '-u', 'origin', *branches, *args)
+    sys.exit(code)
+
+
+def get_remote_tracking_branch(branch: str) -> Optional[str]:
+    """Get the remote tracking branch for a local branch, if any."""
+    code, stdout, _ = git('config', '--get', f'branch.{branch}.remote', check=False)
+    if code != 0 or not stdout:
+        return None
+    remote = stdout
+    code, stdout, _ = git('config', '--get', f'branch.{branch}.merge', check=False)
+    if code != 0 or not stdout:
+        return None
+    # merge is like refs/heads/branch-name, extract the branch name
+    merge_ref = stdout
+    if merge_ref.startswith('refs/heads/'):
+        merge_ref = merge_ref[len('refs/heads/'):]
+    return f"{remote}/{merge_ref}"
+
+
+def cmd_push_remotes(args: List[str]) -> None:
+    """Push only stacked branches that have remote tracking branches."""
+    all_branches = get_all_stacked_branches()
+    if not all_branches:
+        print("No stacked branches found.")
+        return
+
+    # Filter to branches that have remotes
+    branches_with_remotes = [b for b in all_branches if get_remote_tracking_branch(b)]
+
+    if not branches_with_remotes:
+        print("No stacked branches have remote tracking branches.")
+        return
+
+    print(f"Pushing {len(branches_with_remotes)} branch(es) with remotes:")
+    for b in branches_with_remotes:
+        print(f"  {b}")
+
+    code = git_run('push', 'origin', *branches_with_remotes, *args)
+    sys.exit(code)
+
+
+def cmd_delete(args: List[str]) -> None:
+    """Delete a stacked branch and update dependents."""
+    if not args:
+        print("Error: Branch name required")
+        print("Usage: git stack delete <branch>")
+        sys.exit(1)
+
+    branch = args[0]
+    base = get_stack_base(branch)
+
+    # Update dependents to point to this branch's base
+    for dep in get_dependents(branch):
+        set_stack_base(dep, base or 'main')
+        print(f"Updated '{dep}' to be based on '{base}'")
+
+    remove_stack_base(branch)
+    git('branch', '-d', branch)
+    print(f"Deleted stacked branch '{branch}'")
+
+
+def cmd_rename(args: List[str]) -> None:
+    """Rename a stacked branch and update all references."""
+    if not args:
+        print("Error: New branch name required")
+        print("Usage: git stack rename <new-name>           # Rename current branch")
+        print("       git stack rename <old-name> <new-name>")
+        sys.exit(1)
+
+    # If one argument, rename current branch; if two, rename specified branch
+    if len(args) == 1:
+        old_name = get_current_branch()
+        new_name = args[0]
+    else:
+        old_name = args[0]
+        new_name = args[1]
+
+    current = get_current_branch()
+
+    # Check if old branch exists
+    code, _, _ = git('rev-parse', '--verify', old_name, check=False)
+    if code != 0:
+        print(f"Error: Branch '{old_name}' does not exist")
+        sys.exit(1)
+
+    # Check if new branch already exists
+    code, _, _ = git('rev-parse', '--verify', new_name, check=False)
+    if code == 0:
+        print(f"Error: Branch '{new_name}' already exists")
+        sys.exit(1)
+
+    # Get the stack base of the old branch (if any)
+    old_base = get_stack_base(old_name)
+
+    # Get all branches that depend on the old branch
+    dependents = get_dependents(old_name)
+
+    # Rename the git branch
+    git('branch', '-m', old_name, new_name)
+    print(f"Renamed branch '{old_name}' to '{new_name}'")
+
+    # Update stack base for the renamed branch (if it was stacked)
+    if old_base:
+        # Remove old config and set new one
+        remove_stack_base(old_name)
+        set_stack_base(new_name, old_base)
+        print(f"  Updated stack base: '{new_name}' -> '{old_base}'")
+
+    # Update all dependents to point to the new name
+    for dep in dependents:
+        set_stack_base(dep, new_name)
+        print(f"  Updated dependent: '{dep}' -> '{new_name}'")
+
+    # If we were on the old branch, we're now on the new one
+    if current == old_name:
+        print(f"Now on branch '{new_name}'")
+
+
+def _split_auto_detect() -> Tuple[str, str]:
+    """
+    Auto-detect parent and child branches for split command.
+    Returns (parent, child) tuple.
+    Exits with error if detection fails or is ambiguous.
+    """
+    current_commit = git_output('rev-parse', 'HEAD')
+
+    # Find which stacked branches contain this commit
+    relationships = get_all_stack_relationships()
+
+    # Find potential parents: stacked branches whose tip is an ancestor of current commit
+    # or non-stacked bases that are ancestors
+    potential_parents = []
+    for branch, base in relationships.items():
+        # Check if branch tip is ancestor of or equal to current commit
+        branch_commit = git_output('rev-parse', branch, check=False)
+        if branch_commit == current_commit:
+            # Current commit is the tip of this branch - can't split
+            continue
+        # Check if branch is an ancestor of current commit
+        code, _, _ = git('merge-base', '--is-ancestor', branch, current_commit, check=False)
+        if code == 0:
+            potential_parents.append(branch)
+
+    # Also check non-stacked bases
+    all_bases = set(relationships.values())
+    for base in all_bases:
+        if base not in relationships:  # Non-stacked base
+            code, _, _ = git('merge-base', '--is-ancestor', base, current_commit, check=False)
+            if code == 0:
+                potential_parents.append(base)
+
+    # Filter to find the closest parent (the one that is not an ancestor of any other potential parent)
+    closest_parents = []
+    for p in potential_parents:
+        is_closest = True
+        for other in potential_parents:
+            if p != other:
+                # Check if 'other' is a descendant of 'p' (p is ancestor of other)
+                code, _, _ = git('merge-base', '--is-ancestor', p, other, check=False)
+                if code == 0:
+                    # p is ancestor of other, so other is closer
+                    is_closest = False
+                    break
+        if is_closest:
+            closest_parents.append(p)
+
+    if not closest_parents:
+        print("Error: Cannot determine parent branch for current commit")
+        print("Use explicit form: git stack split <new-branch> <parent> <child>")
+        sys.exit(1)
+
+    if len(closest_parents) > 1:
+        print("Error: Ambiguous parent - multiple potential parents found:")
+        for p in closest_parents:
+            print(f"  {p}")
+        print()
+        print("Use explicit form: git stack split <new-branch> <parent> <child>")
+        sys.exit(1)
+
+    parent = closest_parents[0]
+
+    # Find potential children: branches that have current commit as ancestor
+    # and whose base is the detected parent
+    potential_children = []
+    for branch, base in relationships.items():
+        # Check if current commit is ancestor of branch
+        code, _, _ = git('merge-base', '--is-ancestor', current_commit, branch, check=False)
+        if code == 0:
+            # Current commit is ancestor of this branch
+            # Check if the branch's base is our detected parent
+            if base == parent:
+                potential_children.append(branch)
+
+    if not potential_children:
+        print("Error: Cannot determine child branch for current commit")
+        print("No stacked branch found that is based on the detected parent and contains this commit")
+        print()
+        print("Use explicit form: git stack split <new-branch> <parent> <child>")
+        sys.exit(1)
+
+    if len(potential_children) > 1:
+        print("Error: Ambiguous child - multiple potential children found:")
+        for c in potential_children:
+            print(f"  {c}")
+        print()
+        print("Use explicit form: git stack split <new-branch> <parent> <child>")
+        sys.exit(1)
+
+    child = potential_children[0]
+    return parent, child
+
+
+def _split_validate_explicit(parent: str, child: str) -> None:
+    """
+    Validate explicit parent and child arguments for split command.
+    Exits with error if validation fails.
+    """
+    # Validate parent exists
+    code, _, _ = git('rev-parse', '--verify', parent, check=False)
+    if code != 0:
+        print(f"Error: Parent branch '{parent}' does not exist")
+        sys.exit(1)
+
+    # Validate child exists
+    code, _, _ = git('rev-parse', '--verify', child, check=False)
+    if code != 0:
+        print(f"Error: Child branch '{child}' does not exist")
+        sys.exit(1)
+
+    # Validate child is stacked on parent
+    child_base = get_stack_base(child)
+    if child_base != parent:
+        print(f"Error: '{child}' is not stacked on '{parent}'")
+        if child_base:
+            print(f"  '{child}' is stacked on '{child_base}'")
+        else:
+            print(f"  '{child}' is not a stacked branch")
+        sys.exit(1)
+
+
+def cmd_split(args: List[str]) -> None:
+    """Split a commit into a new stacked branch between parent and child."""
+    if not args:
+        print("Error: Branch name required")
+        print("Usage: git stack split <new-branch>                    # Auto-detect parent/child")
+        print("       git stack split <new-branch> <parent> <child>   # Explicit parent/child")
+        sys.exit(1)
+
+    new_branch = args[0]
+
+    # Check if new branch already exists
+    code, _, _ = git('rev-parse', '--verify', new_branch, check=False)
+    if code == 0:
+        print(f"Error: Branch '{new_branch}' already exists")
+        sys.exit(1)
+
+    if len(args) == 1:
+        # Auto-detect mode
+        parent, child = _split_auto_detect()
+    elif len(args) == 3:
+        # Explicit mode
+        parent = args[1]
+        child = args[2]
+        _split_validate_explicit(parent, child)
+    else:
+        print("Error: Invalid number of arguments")
+        print("Usage: git stack split <new-branch>                    # Auto-detect parent/child")
+        print("       git stack split <new-branch> <parent> <child>   # Explicit parent/child")
+        sys.exit(1)
+
+    # Get current commit to create the new branch at
+    current_commit = git_output('rev-parse', 'HEAD')
+
+    # Validate that current commit is between parent and child
+    # 1. Current commit must be descendant of parent (or equal)
+    code, _, _ = git('merge-base', '--is-ancestor', parent, current_commit, check=False)
+    if code != 0:
+        print(f"Error: Current commit is not a descendant of '{parent}'")
+        sys.exit(1)
+
+    # 2. Current commit must be ancestor of child (or equal)
+    code, _, _ = git('merge-base', '--is-ancestor', current_commit, child, check=False)
+    if code != 0:
+        print(f"Error: Current commit is not an ancestor of '{child}'")
+        sys.exit(1)
+
+    # 3. Current commit must not be equal to parent tip
+    parent_commit = git_output('rev-parse', parent)
+    if current_commit == parent_commit:
+        print(f"Error: Current commit is the tip of '{parent}', nothing to split")
+        sys.exit(1)
+
+    # Create the new branch at current commit
+    git('branch', new_branch, current_commit)
+
+    # Set up stack relationships:
+    # new_branch is stacked on parent
+    set_stack_base(new_branch, parent)
+
+    # child is now stacked on new_branch
+    set_stack_base(child, new_branch)
+
+    print(f"Created stacked branch '{new_branch}' at current commit")
+    print(f"  {parent} <- {new_branch} <- {child}")
+    print()
+    print(f"Stack relationships updated:")
+    print(f"  '{new_branch}' is now stacked on '{parent}'")
+    print(f"  '{child}' is now stacked on '{new_branch}'")
+
+
+def cmd_rebase(args: List[str], git_root: Path, state: SyncState) -> None:
+    """Rebase current stack onto a new base."""
+    check_no_sync_in_progress(state)
+
+    if not args:
+        print("Error: New base required")
+        print("Usage: git stack rebase <new-base>")
+        sys.exit(1)
+
+    new_base = args[0]
+    current = get_current_branch()
+    old_base = get_stack_base(current)  # May be None for non-stacked branches
+
+    # Use state management for continue/abort support
+    state.init(current, [current], new_base=new_base)
+
+    if not rebase_onto_new_base(current, new_base, old_base, state, git_root):
+        sys.exit(1)
+
+    state.cleanup()
+    print("Rebase complete.")
+
+
+def cmd_log(args: List[str]) -> None:
+    """Show log of commits in current stack."""
+    current = get_current_branch()
+    base = get_stack_base(current)
+
+    if not base:
+        print("Current branch is not stacked")
+        sys.exit(1)
+
+    code = git_run('log', f'{base}..{current}', *args)
+    sys.exit(code)
+
+
+def cmd_diff(args: List[str]) -> None:
+    """Show diff of current branch against its base."""
+    current = get_current_branch()
+    base = get_stack_base(current)
+
+    if not base:
+        print("Current branch is not stacked")
+        sys.exit(1)
+
+    code = git_run('diff', base, *args)
+    sys.exit(code)
+
+
+def cmd_export(args: List[str]) -> None:
+    """Export stack configuration to JSON."""
+    relationships = get_all_stack_relationships()
+
+    data = {
+        "version": 1,
+        "stacks": relationships
+    }
+
+    json_output = json.dumps(data, indent=2, sort_keys=True)
+
+    if not args or args[0] == '-':
+        # Output to stdout
+        print(json_output)
+    else:
+        # Output to file
+        filepath = args[0]
+        with open(filepath, 'w') as f:
+            f.write(json_output)
+            f.write('\n')
+        print(f"Exported {len(relationships)} stack relationship(s) to '{filepath}'")
+
+
+def cmd_import(args: List[str], update: bool = False) -> None:
+    """Import stack configuration from JSON."""
+    if not args:
+        print("Error: File path required (use '-' for stdin)")
+        print("Usage: git stack import <file>")
+        print("       git stack import-update <file>")
+        sys.exit(1)
+
+    filepath = args[0]
+
+    # Read JSON input
+    if filepath == '-':
+        json_input = sys.stdin.read()
+    else:
+        if not os.path.exists(filepath):
+            print(f"Error: File '{filepath}' not found")
+            sys.exit(1)
+        with open(filepath, 'r') as f:
+            json_input = f.read()
+
+    try:
+        data = json.loads(json_input)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}")
+        sys.exit(1)
+
+    # Validate structure
+    if not isinstance(data, dict):
+        print("Error: JSON must be an object")
+        sys.exit(1)
+
+    if 'stacks' not in data:
+        print("Error: JSON must contain 'stacks' key")
+        sys.exit(1)
+
+    stacks = data['stacks']
+    if not isinstance(stacks, dict):
+        print("Error: 'stacks' must be an object mapping branch -> base")
+        sys.exit(1)
+
+    # If not updating, clear existing configuration first
+    if not update:
+        existing = get_all_stack_relationships()
+        for branch in existing:
+            remove_stack_base(branch)
+
+    # Import new relationships
+    imported_count = 0
+    for branch, base in stacks.items():
+        if not isinstance(branch, str) or not isinstance(base, str):
+            print(f"Warning: Skipping invalid entry: {branch} -> {base}")
+            continue
+        set_stack_base(branch, base)
+        imported_count += 1
+
+    action = "Updated" if update else "Imported"
+    source = "stdin" if filepath == '-' else f"'{filepath}'"
+    print(f"{action} {imported_count} stack relationship(s) from {source}")
+
+
+def cmd_zap(git_root: Path, state: SyncState) -> None:
+    """Remove all stack configuration from the repository."""
+    relationships = get_all_stack_relationships()
+    has_sync_state = state.in_progress()
+
+    if not relationships and not has_sync_state:
+        print("No stack configuration to remove.")
+        return
+
+    # Confirm before deleting
+    if relationships:
+        print(f"This will remove {len(relationships)} stack relationship(s):")
+        for branch, base in sorted(relationships.items()):
+            print(f"  {branch} -> {base}")
+
+    if has_sync_state:
+        if relationships:
+            print()
+        print("This will also clear the in-progress sync/rebase state.")
+
+    print()
+    response = input("Are you sure? [y/N] ")
+    if response.lower() not in ('y', 'yes'):
+        print("Aborted.")
+        sys.exit(1)
+
+    # Clear sync state if present
+    if has_sync_state:
+        # Abort any in-progress rebase first
+        # if is_rebase_in_progress(git_root):
+        #     print("Aborting current rebase...")
+        #     git('rebase', '--abort', check=False)
+        state.cleanup()
+        print("Cleared sync/rebase state.")
+
+    # Remove stack relationships
+    if relationships:
+        for branch in relationships:
+            remove_stack_base(branch)
+        print(f"Removed {len(relationships)} stack relationship(s).")
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main() -> None:
+    args = sys.argv[1:]
+    command = args[0] if args else 'ls'
+    cmd_args = args[1:] if len(args) > 1 else []
+
+    # Commands that don't need git context
+    if command in ('h', 'help', '-h', '--help'):
+        cmd_help()
+        return
+
+    # Get git context
+    try:
+        git_root = get_git_root()
+    except SystemExit:
+        print("Error: Not in a git repository")
+        sys.exit(1)
+
+    state = SyncState(git_root)
+
+    # Dispatch commands
+    if command in ('ls', 'list', 'st', 'status'):
+        cmd_ls(state)
+    elif command in ('cr', 'create'):
+        cmd_create(cmd_args)
+    elif command in ('ad', 'adopt'):
+        cmd_adopt(cmd_args)
+    elif command in ('sp', 'set-parent', 'set_parent', 'sb', 'set-base', 'set_base'):
+        cmd_set_parent(cmd_args)
+    elif command in ('b', 'base'):
+        cmd_base(cmd_args)
+    elif command in ('s1', 'sync1'):
+        cmd_sync1(git_root, state)
+    elif command in ('su', 'sync-up', 'sync_up'):
+        cmd_sync(git_root, state)
+    elif command in ('sd', 'sync-deps', 'sync_deps'):
+        cmd_sync_deps(git_root, state)
+    elif command in ('sa', 'sync-all', 'sync_all'):
+        cmd_sync_all(git_root, state)
+    elif command in ('c', 'continue'):
+        cmd_continue(git_root, state)
+    elif command in ('ab', 'abort'):
+        cmd_abort(git_root, state)
+    elif command in ('aa', 'abort-all', 'abort_all'):
+        cmd_abort_all(git_root, state)
+    elif command in ('rr', 'rebase-reset', 'rebase_reset'):
+        cmd_rebase_reset(git_root, state)
+    elif command in ('p', 'push'):
+        cmd_push(cmd_args)
+    elif command in ('pa', 'push-all', 'push_all'):
+        cmd_push_all(cmd_args)
+    elif command in ('pr', 'push-remotes', 'push_remotes'):
+        cmd_push_remotes(cmd_args)
+    elif command in ('d', 'delete'):
+        cmd_delete(cmd_args)
+    elif command in ('rn', 'rename'):
+        cmd_rename(cmd_args)
+    elif command in ('spl', 'split'):
+        cmd_split(cmd_args)
+    elif command in ('rb', 'rebase'):
+        cmd_rebase(cmd_args, git_root, state)
+    elif command in ('l', 'log'):
+        cmd_log(cmd_args)
+    elif command in ('df', 'diff'):
+        cmd_diff(cmd_args)
+    elif command == 'export':
+        cmd_export(cmd_args)
+    elif command == 'import':
+        cmd_import(cmd_args, update=False)
+    elif command in ('import-update', 'import_update'):
+        cmd_import(cmd_args, update=True)
+    elif command == 'zap':
+        cmd_zap(git_root, state)
+    else:
+        print(f"Unknown subcommand: {command}")
+        cmd_help()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
