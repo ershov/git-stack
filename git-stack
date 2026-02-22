@@ -193,6 +193,19 @@ from collections import defaultdict
 from typing import Optional, List, Dict, Tuple
 
 
+def has_help_flag(args: List[str]) -> bool:
+    """Check if args contain -h or --help."""
+    return '-h' in args or '--help' in args
+
+
+def print_cmd_help(text: str) -> None:
+    """Print command help text (dedented) and exit."""
+    # Strip leading/trailing blank lines but keep indentation structure
+    lines = text.strip().splitlines()
+    print('\n'.join(lines))
+    sys.exit(0)
+
+
 # ============================================================================
 # Git Helper Functions
 # ============================================================================
@@ -289,6 +302,67 @@ def get_dependents(base: str) -> List[str]:
     return [branch for branch, b in relationships.items() if b == base]
 
 
+def find_cycle(relationships: Dict[str, str], start: str) -> Optional[List[str]]:
+    """
+    Detect a cycle starting from 'start' in the given relationships.
+    Returns the cycle as a list [a, b, ..., a] if found, or None.
+    """
+    visited = []
+    current = start
+    seen = set()
+    while current in relationships:
+        if current in seen:
+            # Found a cycle - extract it
+            cycle_start = visited.index(current)
+            return visited[cycle_start:] + [current]
+        seen.add(current)
+        visited.append(current)
+        current = relationships[current]
+    return None
+
+
+def find_all_cycles(relationships: Dict[str, str]) -> List[List[str]]:
+    """
+    Find all unique cycles in the given relationships.
+    Returns a list of cycles, each cycle is [a, b, ..., a].
+    """
+    reported = set()  # frozensets of cycle members to avoid duplicates
+    cycles = []
+    for branch in relationships:
+        cycle = find_cycle(relationships, branch)
+        if cycle:
+            members = frozenset(cycle[:-1])
+            if members not in reported:
+                reported.add(members)
+                cycles.append(cycle)
+    return cycles
+
+
+def check_no_cycles(relationships: Optional[Dict[str, str]] = None) -> None:
+    """
+    Check for circular dependencies and exit with an error if any are found.
+    Call this before any operation that traverses the dependency graph.
+    """
+    if relationships is None:
+        relationships = get_all_stack_relationships()
+    cycles = find_all_cycles(relationships)
+    if cycles:
+        print_cycles(cycles)
+        sys.exit(1)
+
+
+def print_cycles(cycles: List[List[str]]) -> None:
+    """Print a human-readable error message about circular dependencies."""
+    print("Error: Circular dependencies detected!")
+    print()
+    for cycle in cycles:
+        print(f"  {' -> '.join(cycle)}")
+    print()
+    print("Fix with:")
+    print("  git stack set-parent <branch> -          # Detach a branch to break the cycle")
+    print("  git stack set-parent <branch> <new-parent>")
+
+
 # ============================================================================
 # Topological Sort for Dependency Order
 # ============================================================================
@@ -297,10 +371,14 @@ def get_branches_in_dependency_order(target_branch: Optional[str] = None) -> Lis
     """
     Get all stacked branches in topological order (dependencies first).
     If target_branch is specified, only return ancestors of that branch (including itself).
+    Exits with error if circular dependencies are detected.
     """
     relationships = get_all_stack_relationships()
     if not relationships:
         return []
+
+    # Refuse to work if there are cycles
+    check_no_cycles(relationships)
 
     # Build parent and children maps
     parent = relationships  # child -> parent
@@ -596,6 +674,22 @@ def print_tree(state: Optional[SyncState] = None) -> None:
         print("No stacked branches found.")
         return
 
+    # Detect circular dependencies
+    cycles = find_all_cycles(relationships)
+    if cycles:
+        print_cycles(cycles)
+        print()
+        # Still try to display what we can, excluding cycle members
+        cycle_members = set()
+        for cycle in cycles:
+            cycle_members.update(cycle[:-1])
+        # Remove cycle members from relationships for display
+        clean_relationships = {b: p for b, p in relationships.items() if b not in cycle_members}
+        if not clean_relationships:
+            return
+        print("Non-circular branches:")
+        relationships = clean_relationships
+
     current_branch = get_current_branch()
 
     # Get sync state info if available
@@ -679,9 +773,10 @@ def cmd_help() -> None:
     print("Commands:")
     print("  ls, list, st, status    List stacked branches and their status (default command)")
     print("  cr, create <branch>     Create a new stacked branch from current branch")
-    print("  ad, adopt <br> [base]   Tag existing branch as stacked on base")
-    print("  sp, set-parent [b] <p>  Set the parent/base of a branch (default: current)")
-    print("  sb, set-base [b] <p>    Set the parent/base of a branch (default: current)")
+    print("  ad, adopt <ch> [p] ...  Adopt branch onto parent (chain: ch -> p1 -> p2 -> ...)")
+    print("                          Use '-' as parent to detach; -f to force (break cycles)")
+    print("  sp, set-parent [ch] <p> Set the parent of a branch (default: current)")
+    print("  sb, set-base [ch] <p>   Same as set-parent; supports chains, '-', and -f")
     print("  b,  base [new-base]     Show or change the base of current branch")
     print()
     print("Sync commands:")
@@ -714,13 +809,34 @@ def cmd_help() -> None:
     print("  zap                     Remove all stack configuration from repo")
 
 
-def cmd_ls(state: SyncState) -> None:
+def cmd_ls(args: List[str], state: SyncState) -> None:
     """List stacked branches as a tree."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack ls|list|st|status
+
+List all stacked branches as a tree, showing:
+  - Commits ahead of base
+  - Sync status (needs sync)
+  - Remote tracking status
+  - Circular dependency warnings
+  - In-progress sync/rebase status""")
     print_tree(state)
 
 
 def cmd_create(args: List[str]) -> None:
     """Create a new stacked branch."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack cr|create <branch>
+
+Create a new branch from the current branch and mark it as stacked
+on the current branch.
+
+Example:
+  git checkout feature/step1
+  git stack create feature/step2   # step2 is stacked on step1""")
+
     if not args:
         print("Error: Branch name required")
         print("Usage: git stack create <branch>")
@@ -734,19 +850,30 @@ def cmd_create(args: List[str]) -> None:
     print(f"Created stacked branch '{new_branch}' based on '{current}'")
 
 
-def _set_branch_parent(branch: str, parent: str, action: str = "set parent") -> None:
+def _set_branch_parent(branch: str, parent: str, action: str = "set parent", force: bool = False) -> None:
     """
     Helper to set the parent/base of a branch with validation.
 
     Args:
         branch: The branch to modify (will be resolved if '.')
-        parent: The parent/base branch to set
+        parent: The parent/base branch to set, or '-' to detach
         action: Description for error/success messages ("adopt" or "set parent")
+        force: If True, break circular dependencies instead of erroring
     """
     current = get_current_branch()
 
     if branch == '.':
         branch = current
+
+    # Handle detach
+    if parent == '-':
+        old_parent = get_stack_base(branch)
+        if not old_parent:
+            print(f"'{branch}' is not stacked, nothing to detach")
+            return
+        remove_stack_base(branch)
+        print(f"Detached '{branch}' from '{old_parent}'")
+        return
 
     # Validate that branch exists
     code, _, _ = git('rev-parse', '--verify', branch, check=False)
@@ -765,6 +892,32 @@ def _set_branch_parent(branch: str, parent: str, action: str = "set parent") -> 
         print(f"Error: Cannot {action} a branch onto itself")
         sys.exit(1)
 
+    # Check for circular dependency
+    # Simulate what the relationships would look like after this change
+    relationships = get_all_stack_relationships()
+    relationships[branch] = parent
+    cycle = find_cycle(relationships, branch)
+    if cycle:
+        if force:
+            # Break the cycle: detach the branch that would close the loop
+            # The cycle is [a, b, ..., x, a]. We break the last link before
+            # it loops back, i.e. remove the stackbase of the branch just
+            # before 'branch' in the cycle.
+            # cycle[-2] -> cycle[-1](==branch) -> parent -> ... -> cycle[-2]
+            # We detach cycle[-2] from its parent.
+            break_branch = cycle[-2]
+            break_old_parent = get_stack_base(break_branch)
+            remove_stack_base(break_branch)
+            print(f"Warning: Breaking circular dependency by detaching '{break_branch}' from '{break_old_parent}'")
+        else:
+            print(f"Error: Circular dependency detected:")
+            print(f"  {' -> '.join(cycle)}")
+            print()
+            print("To fix this:")
+            print(f"  git stack set-parent <branch> -     # Detach a branch to break the cycle")
+            print(f"  git stack {action} -f ...            # Force: auto-break the cycle")
+            sys.exit(1)
+
     old_parent = get_stack_base(branch)
     set_stack_base(branch, parent)
 
@@ -776,41 +929,111 @@ def _set_branch_parent(branch: str, parent: str, action: str = "set parent") -> 
 
 def cmd_adopt(args: List[str]) -> None:
     """Adopt an existing branch as stacked."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack ad|adopt [options] <branch> [parent ...]
+
+Adopt an existing branch into the stack.
+
+Arguments:
+  <branch>              Branch to adopt (use '.' for current branch)
+  [parent ...]          Parent branch(es); default: current branch
+
+Options:
+  -f                    Force: auto-break circular dependencies
+  -                     Use as parent to detach a branch
+
+Forms:
+  git stack adopt <branch>               # Adopt onto current branch
+  git stack adopt <branch> <parent>      # Adopt onto specified parent
+  git stack adopt <ch> <p1> <p2> ...     # Build chain: ch -> p1 -> p2 -> ...
+  git stack adopt <branch> -             # Detach branch from its parent
+  git stack adopt -f <branch> <parent>   # Force (break cycles)""")
+
+    # Parse -f flag
+    force = '-f' in args
+    args = [a for a in args if a != '-f']
+
     if not args:
         print("Error: Branch name required")
-        print("Usage: git stack adopt <branch> [base]  # Adopt branch onto base (default: current)")
+        print("Usage: git stack adopt <branch> [parent]         # Adopt branch (default parent: current)")
+        print("       git stack adopt <ch> <p1> <p2> ...        # Build chain: ch -> p1 -> p2 -> ...")
+        print("       git stack adopt <branch> -                # Detach branch from parent")
+        print("       git stack adopt -f <branch> <parent>      # Force: auto-break circular deps")
         sys.exit(1)
 
     current = get_current_branch()
-    branch = args[0]
-    base = args[1] if len(args) > 1 else current
 
-    _set_branch_parent(branch, base, action="adopt")
+    if len(args) == 1:
+        # Single arg: adopt branch onto current
+        _set_branch_parent(args[0], current, action="adopt", force=force)
+    else:
+        # Multi-arg: build chain args[0] -> args[1] -> args[2] -> ...
+        for i in range(len(args) - 1):
+            _set_branch_parent(args[i], args[i + 1], action="adopt", force=force)
 
 
 def cmd_set_parent(args: List[str]) -> None:
     """Set the parent/base of a branch."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack sp|set-parent|sb|set-base [options] [branch] <parent>
+
+Set or change the parent (base) of a stacked branch.
+
+Arguments:
+  [branch]              Branch to modify; default: current branch
+  <parent>              New parent branch
+
+Options:
+  -f                    Force: auto-break circular dependencies
+  -                     Use as parent to detach a branch
+
+Forms:
+  git stack set-parent <parent>              # Set parent of current branch
+  git stack set-parent <branch> <parent>     # Set parent of specified branch
+  git stack set-parent <ch> <p1> <p2> ...    # Build chain: ch -> p1 -> p2 -> ...
+  git stack set-parent <branch> -            # Detach branch
+  git stack set-parent -f <branch> <parent>  # Force (break cycles)""")
+
+    # Parse -f flag
+    force = '-f' in args
+    args = [a for a in args if a != '-f']
+
     if not args:
         print("Error: Parent branch required")
-        print("Usage: git stack set-parent <parent>              # Set parent of current branch")
-        print("       git stack set-parent <branch> <parent>     # Set parent of specified branch")
+        print("Usage: git stack set-parent <parent>             # Set parent of current branch")
+        print("       git stack set-parent <parent> -           # Detach current branch")
+        print("       git stack set-parent <ch> <p1> <p2> ...   # Build chain: ch -> p1 -> p2 -> ...")
+        print("       git stack set-parent -f <ch> <parent>     # Force: auto-break circular deps")
         sys.exit(1)
 
     current = get_current_branch()
 
-    # If one argument, set parent of current branch; if two, set parent of specified branch
     if len(args) == 1:
-        branch = current
-        parent = args[0]
+        # Single arg: set parent of current branch
+        _set_branch_parent(current, args[0], action="set parent", force=force)
     else:
-        branch = args[0]
-        parent = args[1]
-
-    _set_branch_parent(branch, parent, action="set parent")
+        # Multi-arg: build chain args[0] -> args[1] -> args[2] -> ...
+        for i in range(len(args) - 1):
+            _set_branch_parent(args[i], args[i + 1], action="set parent", force=force)
 
 
 def cmd_base(args: List[str]) -> None:
     """Show or change the base of current branch."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack b|base [new-base]
+
+Show or change the base (parent) of the current branch.
+
+With no arguments, prints the current base.
+With an argument, changes the base to the specified branch.
+
+Examples:
+  git stack base              # Print current base
+  git stack base main         # Change base to main""")
+
     current = get_current_branch()
 
     if not args:
@@ -827,8 +1050,18 @@ def cmd_base(args: List[str]) -> None:
         print(f"Changed base of '{current}' from '{old_base}' to '{new_base}'")
 
 
-def cmd_sync1(git_root: Path, state: SyncState) -> None:
+def cmd_sync1(args: List[str], git_root: Path, state: SyncState) -> None:
     """Sync current branch with its immediate upstream."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack s1|sync1
+
+Rebase the current branch onto the latest tip of its immediate parent.
+Does not sync any ancestor branches first.
+
+If conflicts occur, resolve them and run:
+  git stack continue""")
+
     check_no_sync_in_progress(state)
 
     current = get_current_branch()
@@ -848,8 +1081,18 @@ def cmd_sync1(git_root: Path, state: SyncState) -> None:
     print("Sync complete.")
 
 
-def cmd_sync(git_root: Path, state: SyncState) -> None:
+def cmd_sync(args: List[str], git_root: Path, state: SyncState) -> None:
     """Sync current branch with all its upstreams."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack su|sync-up
+
+Recursively sync the current branch and all its ancestors.
+Syncs in dependency order: ancestors first, then the current branch.
+
+If conflicts occur at any step, resolve them and run:
+  git stack continue""")
+
     check_no_sync_in_progress(state)
 
     current = get_current_branch()
@@ -869,8 +1112,19 @@ def cmd_sync(git_root: Path, state: SyncState) -> None:
     print("Sync complete.")
 
 
-def cmd_sync_deps(git_root: Path, state: SyncState) -> None:
+def cmd_sync_deps(args: List[str], git_root: Path, state: SyncState) -> None:
     """Sync only dependencies of current branch."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack sd|sync-deps
+
+Sync all ancestor branches of the current branch, but NOT the
+current branch itself. Useful when you want to update your
+dependencies before continuing work.
+
+If conflicts occur, resolve them and run:
+  git stack continue""")
+
     check_no_sync_in_progress(state)
 
     current = get_current_branch()
@@ -899,8 +1153,18 @@ def cmd_sync_deps(git_root: Path, state: SyncState) -> None:
     print("Sync complete.")
 
 
-def cmd_sync_all(git_root: Path, state: SyncState) -> None:
+def cmd_sync_all(args: List[str], git_root: Path, state: SyncState) -> None:
     """Sync all stacked branches."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack sa|sync-all
+
+Sync ALL stacked branches in the repository in dependency order.
+Returns to the original branch when complete.
+
+If conflicts occur, resolve them and run:
+  git stack continue""")
+
     check_no_sync_in_progress(state)
 
     current = get_current_branch()
@@ -921,8 +1185,16 @@ def cmd_sync_all(git_root: Path, state: SyncState) -> None:
     print("Sync complete.")
 
 
-def cmd_continue(git_root: Path, state: SyncState) -> None:
+def cmd_continue(args: List[str], git_root: Path, state: SyncState) -> None:
     """Continue sync after resolving conflicts."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack c|continue
+
+Continue a sync/rebase operation after resolving conflicts.
+First completes any in-progress git rebase, then continues
+with remaining branches.""")
+
     if not state.in_progress():
         print("No sync operation in progress.")
         sys.exit(1)
@@ -964,8 +1236,16 @@ def cmd_continue(git_root: Path, state: SyncState) -> None:
     print("Sync complete.")
 
 
-def cmd_abort(git_root: Path, state: SyncState) -> None:
+def cmd_abort(args: List[str], git_root: Path, state: SyncState) -> None:
     """Abort current rebase, continue with remaining branches."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack ab|abort
+
+Abort the current in-progress rebase and skip to the next branch.
+Already-completed branches are NOT restored. Use abort-all to
+restore everything.""")
+
     if not state.in_progress():
         print("No sync operation in progress.")
         sys.exit(1)
@@ -1002,8 +1282,16 @@ def cmd_abort(git_root: Path, state: SyncState) -> None:
         print("Sync complete (with some branches skipped).")
 
 
-def cmd_abort_all(git_root: Path, state: SyncState) -> None:
+def cmd_abort_all(args: List[str], git_root: Path, state: SyncState) -> None:
     """Abort and restore all branches to original state."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack aa|abort-all
+
+Abort the current sync/rebase operation and restore ALL branches
+to their original state (before the sync started). Returns to
+the original branch.""")
+
     if not state.in_progress():
         print("No sync operation in progress.")
         sys.exit(1)
@@ -1023,8 +1311,16 @@ def cmd_abort_all(git_root: Path, state: SyncState) -> None:
     print("Sync aborted. All branches restored to original state.")
 
 
-def cmd_rebase_reset(git_root: Path, state: SyncState) -> None:
+def cmd_rebase_reset(args: List[str], git_root: Path, state: SyncState) -> None:
     """Clear rebase state without restoring branches."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack rr|rebase-reset
+
+Clear the sync/rebase state without restoring branches to their
+original state. Use this when you've manually resolved the situation
+and just want to clean up the state files.""")
+
     if not state.in_progress():
         print("No sync operation in progress.")
         sys.exit(1)
@@ -1040,6 +1336,17 @@ def cmd_rebase_reset(git_root: Path, state: SyncState) -> None:
 
 def cmd_push(args: List[str]) -> None:
     """Push current stacked branch to remote."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack p|push [git-push-options]
+
+Push the current stacked branch to origin. Sets up upstream tracking.
+Extra arguments are passed through to git push.
+
+Examples:
+  git stack push
+  git stack push --force-with-lease""")
+
     current = get_current_branch()
     code = git_run('push', '-u', 'origin', current, *args)
     sys.exit(code)
@@ -1047,6 +1354,17 @@ def cmd_push(args: List[str]) -> None:
 
 def cmd_push_all(args: List[str]) -> None:
     """Push all stacked branches to remote."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack pa|push-all [git-push-options]
+
+Push ALL stacked branches to origin. Sets up upstream tracking.
+Extra arguments are passed through to git push.
+
+Examples:
+  git stack push-all
+  git stack push-all --force-with-lease""")
+
     branches = get_all_stacked_branches()
     if not branches:
         print("No stacked branches to push.")
@@ -1074,6 +1392,18 @@ def get_remote_tracking_branch(branch: str) -> Optional[str]:
 
 def cmd_push_remotes(args: List[str]) -> None:
     """Push only stacked branches that have remote tracking branches."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack pr|push-remotes [git-push-options]
+
+Push only stacked branches that already have remote tracking branches.
+Useful for updating already-published branches without pushing new ones.
+
+Examples:
+  git stack push-remotes
+  git stack push-remotes --force
+  git stack push-remotes --force-with-lease""")
+
     all_branches = get_all_stacked_branches()
     if not all_branches:
         print("No stacked branches found.")
@@ -1096,6 +1426,18 @@ def cmd_push_remotes(args: List[str]) -> None:
 
 def cmd_delete(args: List[str]) -> None:
     """Delete a stacked branch and update dependents."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack d|delete <branch>
+
+Delete a stacked branch and re-parent its dependents to
+the deleted branch's base.
+
+Example:
+  # main <- step1 <- step2 <- step3
+  git stack delete step2
+  # Result: main <- step1 <- step3  (step3 re-parented to step1)""")
+
     if not args:
         print("Error: Branch name required")
         print("Usage: git stack delete <branch>")
@@ -1116,6 +1458,17 @@ def cmd_delete(args: List[str]) -> None:
 
 def cmd_rename(args: List[str]) -> None:
     """Rename a stacked branch and update all references."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack rn|rename [<old-name>] <new-name>
+
+Rename a stacked branch and update all stack references.
+If only one argument is given, renames the current branch.
+
+Examples:
+  git stack rename new-name              # Rename current branch
+  git stack rename old-name new-name     # Rename specific branch""")
+
     if not args:
         print("Error: New branch name required")
         print("Usage: git stack rename <new-name>           # Rename current branch")
@@ -1295,6 +1648,20 @@ def _split_validate_explicit(parent: str, child: str) -> None:
 
 def cmd_split(args: List[str]) -> None:
     """Split a commit into a new stacked branch between parent and child."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack spl|split <new-branch> [<parent> <child>]
+
+Create a new stacked branch at the current commit, inserting it
+between a parent and child branch in the stack.
+
+With one argument, auto-detects the parent and child branches.
+With three arguments, uses the specified parent and child.
+
+Examples:
+  git stack split feature/middle                        # Auto-detect
+  git stack split feature/middle feature/base feature/top  # Explicit""")
+
     if not args:
         print("Error: Branch name required")
         print("Usage: git stack split <new-branch>                    # Auto-detect parent/child")
@@ -1365,6 +1732,16 @@ def cmd_split(args: List[str]) -> None:
 
 def cmd_rebase(args: List[str], git_root: Path, state: SyncState) -> None:
     """Rebase current stack onto a new base."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack rb|rebase <new-base>
+
+Rebase the current branch onto a completely new base branch.
+Updates the stack base after successful rebase.
+
+If conflicts occur, resolve them and run:
+  git stack continue""")
+
     check_no_sync_in_progress(state)
 
     if not args:
@@ -1388,6 +1765,18 @@ def cmd_rebase(args: List[str], git_root: Path, state: SyncState) -> None:
 
 def cmd_log(args: List[str]) -> None:
     """Show log of commits in current stack."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack l|log [git-log-options]
+
+Show commits in the current branch that are not in its base.
+Extra arguments are passed through to git log.
+
+Examples:
+  git stack log
+  git stack log --oneline
+  git stack log --stat""")
+
     current = get_current_branch()
     base = get_stack_base(current)
 
@@ -1401,6 +1790,18 @@ def cmd_log(args: List[str]) -> None:
 
 def cmd_diff(args: List[str]) -> None:
     """Show diff of current branch against its base."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack df|diff [git-diff-options]
+
+Show the diff between the current branch and its base.
+Extra arguments are passed through to git diff.
+
+Examples:
+  git stack diff
+  git stack diff --stat
+  git stack diff -- src/""")
+
     current = get_current_branch()
     base = get_stack_base(current)
 
@@ -1414,6 +1815,18 @@ def cmd_diff(args: List[str]) -> None:
 
 def cmd_export(args: List[str]) -> None:
     """Export stack configuration to JSON."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack export [file]
+
+Export all stack relationships to JSON format.
+Writes to stdout by default, or to a file if specified.
+
+Examples:
+  git stack export                  # Print to stdout
+  git stack export stacks.json     # Write to file
+  git stack export -               # Explicit stdout""")
+
     relationships = get_all_stack_relationships()
 
     data = {
@@ -1437,6 +1850,27 @@ def cmd_export(args: List[str]) -> None:
 
 def cmd_import(args: List[str], update: bool = False) -> None:
     """Import stack configuration from JSON."""
+    if has_help_flag(args):
+        if update:
+            print_cmd_help("""\
+Usage: git stack import-update <file>
+
+Import stack configuration from JSON, merging with existing
+configuration. Existing relationships are preserved; new ones
+are added or updated.
+
+Use '-' to read from stdin.""")
+        else:
+            print_cmd_help("""\
+Usage: git stack import <file>
+
+Import stack configuration from JSON, replacing all existing
+configuration. All current stack relationships are removed first.
+
+Use '-' to read from stdin.
+
+See also: git stack import-update (merge instead of replace)""")
+
     if not args:
         print("Error: File path required (use '-' for stdin)")
         print("Usage: git stack import <file>")
@@ -1495,8 +1929,18 @@ def cmd_import(args: List[str], update: bool = False) -> None:
     print(f"{action} {imported_count} stack relationship(s) from {source}")
 
 
-def cmd_zap(git_root: Path, state: SyncState) -> None:
+def cmd_zap(args: List[str], git_root: Path, state: SyncState) -> None:
     """Remove all stack configuration from the repository."""
+    if has_help_flag(args):
+        print_cmd_help("""\
+Usage: git stack zap
+
+Remove ALL stack configuration from the repository.
+This includes all branch relationships and any in-progress
+sync/rebase state. Prompts for confirmation before proceeding.
+
+The git branches themselves are NOT deleted.""")
+
     relationships = get_all_stack_relationships()
     has_sync_state = state.in_progress()
 
@@ -1562,7 +2006,7 @@ def main() -> None:
 
     # Dispatch commands
     if command in ('ls', 'list', 'st', 'status'):
-        cmd_ls(state)
+        cmd_ls(cmd_args, state)
     elif command in ('cr', 'create'):
         cmd_create(cmd_args)
     elif command in ('ad', 'adopt'):
@@ -1572,21 +2016,21 @@ def main() -> None:
     elif command in ('b', 'base'):
         cmd_base(cmd_args)
     elif command in ('s1', 'sync1'):
-        cmd_sync1(git_root, state)
+        cmd_sync1(cmd_args, git_root, state)
     elif command in ('su', 'sync-up', 'sync_up'):
-        cmd_sync(git_root, state)
+        cmd_sync(cmd_args, git_root, state)
     elif command in ('sd', 'sync-deps', 'sync_deps'):
-        cmd_sync_deps(git_root, state)
+        cmd_sync_deps(cmd_args, git_root, state)
     elif command in ('sa', 'sync-all', 'sync_all'):
-        cmd_sync_all(git_root, state)
+        cmd_sync_all(cmd_args, git_root, state)
     elif command in ('c', 'continue'):
-        cmd_continue(git_root, state)
+        cmd_continue(cmd_args, git_root, state)
     elif command in ('ab', 'abort'):
-        cmd_abort(git_root, state)
+        cmd_abort(cmd_args, git_root, state)
     elif command in ('aa', 'abort-all', 'abort_all'):
-        cmd_abort_all(git_root, state)
+        cmd_abort_all(cmd_args, git_root, state)
     elif command in ('rr', 'rebase-reset', 'rebase_reset'):
-        cmd_rebase_reset(git_root, state)
+        cmd_rebase_reset(cmd_args, git_root, state)
     elif command in ('p', 'push'):
         cmd_push(cmd_args)
     elif command in ('pa', 'push-all', 'push_all'):
@@ -1612,7 +2056,7 @@ def main() -> None:
     elif command in ('import-update', 'import_update'):
         cmd_import(cmd_args, update=True)
     elif command == 'zap':
-        cmd_zap(git_root, state)
+        cmd_zap(cmd_args, git_root, state)
     else:
         print(f"Unknown subcommand: {command}")
         cmd_help()
