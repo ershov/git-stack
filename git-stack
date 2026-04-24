@@ -565,16 +565,25 @@ def sync_single_branch(branch: str, state: SyncState, git_root: Path) -> bool:
         state.mark_completed(branch)
         return True
     else:
-        # If rebase failed but nothing is in progress, clean up state
-        if not is_rebase_in_progress(git_root) and not state.get_completed_branches():
-            state.cleanup()
-            print()
-            print(f"Rebase failed for '{branch}'.")
-        else:
+        if is_rebase_in_progress(git_root):
+            # Rebase stopped mid-way due to conflicts.
             print()
             print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
             print("  git stack continue      - Continue after resolving conflicts")
             print("  git stack abort         - Abort this rebase and skip to next branch")
+            print("  git stack abort-all     - Abort and restore all branches")
+        elif not state.get_completed_branches():
+            # Failed immediately, nothing was changed – clean up state.
+            state.cleanup()
+            print()
+            print(f"Rebase failed for '{branch}'.")
+        else:
+            # Rebase tool itself errored after partial progress (no conflict to
+            # resolve).  State is preserved so the user can inspect and recover.
+            print()
+            print(f"Rebase failed for '{branch}' (no conflict state left).")
+            print("If you have manually fixed the situation, run:")
+            print("  git stack rebase-reset  - Clear state without restoring branches")
             print("  git stack abort-all     - Abort and restore all branches")
         return False
 
@@ -600,16 +609,21 @@ def rebase_onto_new_base(branch: str, new_base: str, old_base: Optional[str], st
         state.mark_completed(branch)
         return True
     else:
-        # If rebase failed but nothing is in progress, clean up state
-        if not is_rebase_in_progress(git_root) and not state.get_completed_branches():
+        if is_rebase_in_progress(git_root):
+            print()
+            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
+            print("  git stack continue      - Continue after resolving conflicts")
+            print("  git stack abort         - Abort this rebase and restore original state")
+            print("  git stack abort-all     - Abort and restore all branches")
+        elif not state.get_completed_branches():
             state.cleanup()
             print()
             print(f"Rebase failed for '{branch}'.")
         else:
             print()
-            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
-            print("  git stack continue      - Continue after resolving conflicts")
-            print("  git stack abort         - Abort this rebase and restore original state")
+            print(f"Rebase failed for '{branch}' (no conflict state left).")
+            print("If you have manually fixed the situation, run:")
+            print("  git stack rebase-reset  - Clear state without restoring branches")
             print("  git stack abort-all     - Abort and restore all branches")
         return False
 
@@ -1146,6 +1160,9 @@ If conflicts occur, resolve them and run:
 
     for branch in branches:
         if not sync_single_branch(branch, state, git_root):
+            # Return to the original branch before exiting so the user isn't
+            # stranded on a random branch.
+            git('checkout', current, check=False)
             sys.exit(1)
 
     state.cleanup()
@@ -1203,6 +1220,7 @@ with remaining branches.""")
     new_base = state.get_new_base()
 
     # First, try to continue any in-progress rebase
+    current_sync = state.get_current_sync_branch()
     if is_rebase_in_progress(git_root):
         print("Continuing rebase...")
         code = git_run('rebase', '--continue')
@@ -1212,12 +1230,17 @@ with remaining branches.""")
             sys.exit(1)
 
         # Mark current branch as completed
-        current_sync = state.get_current_sync_branch()
         if current_sync:
             # If this was a rebase onto new base, update the stack base
             if new_base:
                 set_stack_base(current_sync, new_base)
             state.mark_completed(current_sync)
+    elif current_sync:
+        # The user may have run `git rebase --continue` manually; the rebase is
+        # already done.  Mark this branch complete so we don't re-sync it.
+        if new_base:
+            set_stack_base(current_sync, new_base)
+        state.mark_completed(current_sync)
 
     # Continue with remaining branches
     for branch in state.get_remaining_branches():
@@ -1271,15 +1294,23 @@ restore everything.""")
         print("Sync aborted. No remaining branches.")
     else:
         print("Continuing with remaining branches...")
+        skipped = [current_sync] if current_sync else []
         for branch in remaining:
             if not sync_single_branch(branch, state, git_root):
+                # Return to original branch before stopping
+                original = state.get_original_branch()
+                if original:
+                    git('checkout', original, check=False)
                 sys.exit(1)
 
         original = state.get_original_branch()
         state.cleanup()
         if original:
             git('checkout', original)
-        print("Sync complete (with some branches skipped).")
+        if skipped:
+            print(f"Sync complete (skipped: {', '.join(skipped)}).")
+        else:
+            print("Sync complete.")
 
 
 def cmd_abort_all(args: List[str], git_root: Path, state: SyncState) -> None:
