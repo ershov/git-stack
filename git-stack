@@ -10,7 +10,7 @@ Supported commands:
   git stack base [new-base]        # Show or change the base of current stacked branch
   git stack sync1                  # Sync current branch with its immediate upstream
   git stack sync-up                # Sync current branch with all its upstreams (recursive)
-  git stack sync-deps              # Sync only dependencies of the current branch (not current)
+  git stack sync-deps              # Sync dependants (descendants) of the current branch
   git stack sync-all               # Sync all stacked branches in the repository
   git stack continue               # Continue sync after resolving conflicts
   git stack abort                  # Abort current rebase, continue with remaining branches
@@ -78,10 +78,10 @@ Scenario B: Recursively sync current branch (sync all ancestors first):
   $ git stack sync-up
   # First syncs step1 onto main, then step2 onto step1, then step3 onto step2
 
-Scenario C: Sync only the dependencies (not the current branch):
-  $ git checkout feature/step3
+Scenario C: Sync only the dependants (not the current branch):
+  $ git checkout feature/step1
   $ git stack sync-deps
-  # Syncs step1 and step2, but leaves step3 as-is
+  # Syncs step2 and step3, but leaves step1 as-is
 
 Scenario D: Sync all stacked branches in the repo:
   $ git stack sync-all
@@ -422,6 +422,42 @@ def get_branches_in_dependency_order(target_branch: Optional[str] = None) -> Lis
             if in_degree[child] == 0:
                 queue.append(child)
         queue.sort()  # Keep deterministic order
+
+    return result
+
+
+def get_descendants_in_dependency_order(root_branch: str) -> List[str]:
+    """
+    Get all stacked branches that are descendants of root_branch
+    (i.e. have root_branch somewhere in their ancestry chain),
+    in topological order (parents before children), NOT including root_branch itself.
+    Exits with error if circular dependencies are detected.
+    """
+    relationships = get_all_stack_relationships()
+    if not relationships:
+        return []
+
+    check_no_cycles(relationships)
+
+    # Build children map
+    children: Dict[str, List[str]] = defaultdict(list)
+    for child, par in relationships.items():
+        children[par].append(child)
+
+    # BFS/DFS from root_branch collecting all descendants in topo order
+    result: List[str] = []
+    queue = sorted(children.get(root_branch, []))
+    visited: set = set()
+    while queue:
+        branch = queue.pop(0)
+        if branch in visited:
+            continue
+        visited.add(branch)
+        result.append(branch)
+        for child in sorted(children.get(branch, [])):
+            if child not in visited:
+                queue.append(child)
+        queue.sort()
 
     return result
 
@@ -796,7 +832,7 @@ def cmd_help() -> None:
     print("Sync commands:")
     print("  s1, sync1               Sync current branch with its immediate upstream")
     print("  su, sync-up             Sync current branch with all its upstreams")
-    print("  sd, sync-deps           Sync only dependencies of the current branch")
+    print("  sd, sync-deps           Sync dependants (descendants) of the current branch")
     print("  sa, sync-all            Sync all stacked branches")
     print("  c, continue             Continue sync after resolving conflicts")
     print("  ab, abort               Abort current rebase, continue with remaining")
@@ -1127,14 +1163,16 @@ If conflicts occur at any step, resolve them and run:
 
 
 def cmd_sync_deps(args: List[str], git_root: Path, state: SyncState) -> None:
-    """Sync only dependencies of current branch."""
+    """Sync dependants (descendants) of the current branch."""
     if has_help_flag(args):
         print_cmd_help("""\
 Usage: git stack sd|sync-deps
 
-Sync all ancestor branches of the current branch, but NOT the
-current branch itself. Useful when you want to update your
-dependencies before continuing work.
+Sync all branches that depend on (are descendants of) the current
+branch, but NOT the current branch itself. Useful after amending or
+force-pushing the current branch to cascade the change downward.
+
+Syncs in dependency order: direct children first, then grandchildren.
 
 If conflicts occur, resolve them and run:
   git stack continue""")
@@ -1142,26 +1180,17 @@ If conflicts occur, resolve them and run:
     check_no_sync_in_progress(state)
 
     current = get_current_branch()
-    base = get_stack_base(current)
 
-    if not base:
-        print("Current branch is not stacked")
-        sys.exit(1)
-
-    # Get ancestors, excluding current branch
-    all_branches = get_branches_in_dependency_order(current)
-    branches = [b for b in all_branches if b != current]
+    branches = get_descendants_in_dependency_order(current)
 
     if not branches:
-        print("No dependencies to sync.")
+        print("No dependants to sync.")
         return
 
     state.init(current, branches)
 
     for branch in branches:
         if not sync_single_branch(branch, state, git_root):
-            # Return to the original branch before exiting so the user isn't
-            # stranded on a random branch.
             git('checkout', current, check=False)
             sys.exit(1)
 
