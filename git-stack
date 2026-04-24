@@ -265,6 +265,15 @@ def get_stack_base(branch: Optional[str] = None) -> Optional[str]:
     return stdout if code == 0 and stdout else None
 
 
+def require_stacked(branch: str) -> str:
+    """Return the stack base for a branch, or exit with error if not stacked."""
+    base = get_stack_base(branch)
+    if not base:
+        print(f"Current branch is not stacked" if branch == get_current_branch() else f"Branch '{branch}' is not stacked")
+        sys.exit(1)
+    return base
+
+
 def set_stack_base(branch: str, base: str) -> None:
     """Set the stack base for a branch."""
     git('config', f'branch.{branch}.stackbase', base)
@@ -300,6 +309,14 @@ def get_dependents(base: str) -> List[str]:
     """Get all branches that depend on the given base."""
     relationships = get_all_stack_relationships()
     return [branch for branch, b in relationships.items() if b == base]
+
+
+def require_branch_exists(branch: str, label: str = "Branch") -> None:
+    """Check that a branch exists, exit with error if not."""
+    code, _, _ = git('rev-parse', '--verify', branch, check=False)
+    if code != 0:
+        print(f"Error: {label} '{branch}' does not exist")
+        sys.exit(1)
 
 
 def find_cycle(relationships: Dict[str, str], start: str) -> Optional[List[str]]:
@@ -581,6 +598,41 @@ def check_no_sync_in_progress(state: SyncState) -> None:
         sys.exit(1)
 
 
+def _handle_rebase_failure(branch: str, state: SyncState, git_root: Path, abort_msg: str = "skip to next branch") -> None:
+    """Print appropriate error message after a failed rebase."""
+    if is_rebase_in_progress(git_root):
+        print()
+        print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
+        print("  git stack continue      - Continue after resolving conflicts")
+        print(f"  git stack abort         - Abort this rebase and {abort_msg}")
+        print("  git stack abort-all     - Abort and restore all branches")
+    elif not state.get_completed_branches():
+        state.cleanup()
+        print()
+        print(f"Rebase failed for '{branch}'.")
+    else:
+        print()
+        print(f"Rebase failed for '{branch}' (no conflict state left).")
+        print("If you have manually fixed the situation, run:")
+        print("  git stack rebase-reset  - Clear state without restoring branches")
+        print("  git stack abort-all     - Abort and restore all branches")
+
+
+def _run_sync_loop(branches: List[str], original: str, state: SyncState, git_root: Path) -> None:
+    """
+    Run the sync loop over a list of branches, then restore original branch.
+    Exits with error if any branch fails to sync.
+    """
+    state.init(original, branches)
+    for branch in branches:
+        if not sync_single_branch(branch, state, git_root):
+            git('checkout', original, check=False)
+            sys.exit(1)
+    state.cleanup()
+    git('checkout', original)
+    print("Sync complete.")
+
+
 def sync_single_branch(branch: str, state: SyncState, git_root: Path) -> bool:
     """
     Sync a single branch onto its base.
@@ -601,26 +653,7 @@ def sync_single_branch(branch: str, state: SyncState, git_root: Path) -> bool:
         state.mark_completed(branch)
         return True
     else:
-        if is_rebase_in_progress(git_root):
-            # Rebase stopped mid-way due to conflicts.
-            print()
-            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
-            print("  git stack continue      - Continue after resolving conflicts")
-            print("  git stack abort         - Abort this rebase and skip to next branch")
-            print("  git stack abort-all     - Abort and restore all branches")
-        elif not state.get_completed_branches():
-            # Failed immediately, nothing was changed – clean up state.
-            state.cleanup()
-            print()
-            print(f"Rebase failed for '{branch}'.")
-        else:
-            # Rebase tool itself errored after partial progress (no conflict to
-            # resolve).  State is preserved so the user can inspect and recover.
-            print()
-            print(f"Rebase failed for '{branch}' (no conflict state left).")
-            print("If you have manually fixed the situation, run:")
-            print("  git stack rebase-reset  - Clear state without restoring branches")
-            print("  git stack abort-all     - Abort and restore all branches")
+        _handle_rebase_failure(branch, state, git_root)
         return False
 
 
@@ -645,22 +678,7 @@ def rebase_onto_new_base(branch: str, new_base: str, old_base: Optional[str], st
         state.mark_completed(branch)
         return True
     else:
-        if is_rebase_in_progress(git_root):
-            print()
-            print(f"Rebase failed for '{branch}'. Resolve conflicts and then run:")
-            print("  git stack continue      - Continue after resolving conflicts")
-            print("  git stack abort         - Abort this rebase and restore original state")
-            print("  git stack abort-all     - Abort and restore all branches")
-        elif not state.get_completed_branches():
-            state.cleanup()
-            print()
-            print(f"Rebase failed for '{branch}'.")
-        else:
-            print()
-            print(f"Rebase failed for '{branch}' (no conflict state left).")
-            print("If you have manually fixed the situation, run:")
-            print("  git stack rebase-reset  - Clear state without restoring branches")
-            print("  git stack abort-all     - Abort and restore all branches")
+        _handle_rebase_failure(branch, state, git_root, abort_msg="restore original state")
         return False
 
 
@@ -926,16 +944,10 @@ def _set_branch_parent(branch: str, parent: str, action: str = "set parent", for
         return
 
     # Validate that branch exists
-    code, _, _ = git('rev-parse', '--verify', branch, check=False)
-    if code != 0:
-        print(f"Error: Branch '{branch}' does not exist")
-        sys.exit(1)
+    require_branch_exists(branch)
 
     # Validate that parent exists
-    code, _, _ = git('rev-parse', '--verify', parent, check=False)
-    if code != 0:
-        print(f"Error: Parent branch '{parent}' does not exist")
-        sys.exit(1)
+    require_branch_exists(parent, label="Parent branch")
 
     # Prevent self-reference
     if branch == parent:
@@ -977,6 +989,32 @@ def _set_branch_parent(branch: str, parent: str, action: str = "set parent", for
         print(f"Set parent of '{branch}' to '{parent}'")
 
 
+def _apply_parent_chain(args: List[str], action: str, force: bool, single_arg_branch_is_first: bool) -> None:
+    """
+    Shared dispatch logic for adopt/set-parent after argument parsing.
+
+    Args:
+        args:                       Remaining args after -f has been stripped.
+        action:                     Label for error messages ("adopt" or "set parent").
+        force:                      Whether -f was passed.
+        single_arg_branch_is_first: If True (adopt), single arg means the arg IS the
+                                    branch and current branch is the parent.
+                                    If False (set-parent), single arg means the arg IS
+                                    the parent and current branch is the branch.
+    """
+    current = get_current_branch()
+
+    if len(args) == 1:
+        if single_arg_branch_is_first:
+            _set_branch_parent(args[0], current, action=action, force=force)
+        else:
+            _set_branch_parent(current, args[0], action=action, force=force)
+    else:
+        # Multi-arg: build chain args[0] -> args[1] -> args[2] -> ...
+        for i in range(len(args) - 1):
+            _set_branch_parent(args[i], args[i + 1], action=action, force=force)
+
+
 def cmd_adopt(args: List[str]) -> None:
     """Adopt an existing branch as stacked."""
     if has_help_flag(args):
@@ -1000,7 +1038,6 @@ Forms:
   git stack adopt <branch> -             # Detach branch from its parent
   git stack adopt -f <branch> <parent>   # Force (break cycles)""")
 
-    # Parse -f flag
     force = '-f' in args
     args = [a for a in args if a != '-f']
 
@@ -1012,15 +1049,7 @@ Forms:
         print("       git stack adopt -f <branch> <parent>      # Force: auto-break circular deps")
         sys.exit(1)
 
-    current = get_current_branch()
-
-    if len(args) == 1:
-        # Single arg: adopt branch onto current
-        _set_branch_parent(args[0], current, action="adopt", force=force)
-    else:
-        # Multi-arg: build chain args[0] -> args[1] -> args[2] -> ...
-        for i in range(len(args) - 1):
-            _set_branch_parent(args[i], args[i + 1], action="adopt", force=force)
+    _apply_parent_chain(args, action="adopt", force=force, single_arg_branch_is_first=True)
 
 
 def cmd_set_parent(args: List[str]) -> None:
@@ -1046,7 +1075,6 @@ Forms:
   git stack set-parent <branch> -            # Detach branch
   git stack set-parent -f <branch> <parent>  # Force (break cycles)""")
 
-    # Parse -f flag
     force = '-f' in args
     args = [a for a in args if a != '-f']
 
@@ -1058,15 +1086,7 @@ Forms:
         print("       git stack set-parent -f <ch> <parent>     # Force: auto-break circular deps")
         sys.exit(1)
 
-    current = get_current_branch()
-
-    if len(args) == 1:
-        # Single arg: set parent of current branch
-        _set_branch_parent(current, args[0], action="set parent", force=force)
-    else:
-        # Multi-arg: build chain args[0] -> args[1] -> args[2] -> ...
-        for i in range(len(args) - 1):
-            _set_branch_parent(args[i], args[i + 1], action="set parent", force=force)
+    _apply_parent_chain(args, action="set parent", force=force, single_arg_branch_is_first=False)
 
 
 def cmd_base(args: List[str]) -> None:
@@ -1125,16 +1145,7 @@ If conflicts occur, resolve them and run:
         print(f"Branch '{target}' is not stacked")
         sys.exit(1)
 
-    # Use state management for continue/abort support
-    state.init(original, [target])
-
-    if not sync_single_branch(target, state, git_root):
-        git('checkout', original, check=False)
-        sys.exit(1)
-
-    state.cleanup()
-    git('checkout', original)
-    print("Sync complete.")
+    _run_sync_loop([target], original, state, git_root)
 
 
 def cmd_sync(args: List[str], git_root: Path, state: SyncState) -> None:
@@ -1164,16 +1175,7 @@ If conflicts occur at any step, resolve them and run:
         print(f"Branch '{target}' is not stacked")
         sys.exit(1)
 
-    state.init(original, branches)
-
-    for branch in branches:
-        if not sync_single_branch(branch, state, git_root):
-            git('checkout', original, check=False)
-            sys.exit(1)
-
-    state.cleanup()
-    git('checkout', original)
-    print("Sync complete.")
+    _run_sync_loop(branches, original, state, git_root)
 
 
 def cmd_sync_deps(args: List[str], git_root: Path, state: SyncState) -> None:
@@ -1205,16 +1207,7 @@ If conflicts occur, resolve them and run:
         print(f"No dependants to sync for '{target}'.")
         return
 
-    state.init(original, branches)
-
-    for branch in branches:
-        if not sync_single_branch(branch, state, git_root):
-            git('checkout', original, check=False)
-            sys.exit(1)
-
-    state.cleanup()
-    git('checkout', original)
-    print("Sync complete.")
+    _run_sync_loop(branches, original, state, git_root)
 
 
 def cmd_sync_all(args: List[str], git_root: Path, state: SyncState) -> None:
@@ -1238,15 +1231,7 @@ If conflicts occur, resolve them and run:
         print("No stacked branches to sync.")
         return
 
-    state.init(current, branches)
-
-    for branch in branches:
-        if not sync_single_branch(branch, state, git_root):
-            sys.exit(1)
-
-    state.cleanup()
-    git('checkout', current)
-    print("Sync complete.")
+    _run_sync_loop(branches, current, state, git_root)
 
 
 def cmd_continue(args: List[str], git_root: Path, state: SyncState) -> None:
@@ -1564,10 +1549,7 @@ Examples:
     current = get_current_branch()
 
     # Check if old branch exists
-    code, _, _ = git('rev-parse', '--verify', old_name, check=False)
-    if code != 0:
-        print(f"Error: Branch '{old_name}' does not exist")
-        sys.exit(1)
+    require_branch_exists(old_name)
 
     # Check if new branch already exists
     code, _, _ = git('rev-parse', '--verify', new_name, check=False)
@@ -1702,16 +1684,10 @@ def _split_validate_explicit(parent: str, child: str) -> None:
     Exits with error if validation fails.
     """
     # Validate parent exists
-    code, _, _ = git('rev-parse', '--verify', parent, check=False)
-    if code != 0:
-        print(f"Error: Parent branch '{parent}' does not exist")
-        sys.exit(1)
+    require_branch_exists(parent, label="Parent branch")
 
     # Validate child exists
-    code, _, _ = git('rev-parse', '--verify', child, check=False)
-    if code != 0:
-        print(f"Error: Child branch '{child}' does not exist")
-        sys.exit(1)
+    require_branch_exists(child, label="Child branch")
 
     # Validate child is stacked on parent
     child_base = get_stack_base(child)
@@ -1856,11 +1832,7 @@ Examples:
   git stack log --stat""")
 
     current = get_current_branch()
-    base = get_stack_base(current)
-
-    if not base:
-        print("Current branch is not stacked")
-        sys.exit(1)
+    base = require_stacked(current)
 
     code = git_run('log', f'{base}..{current}', *args)
     sys.exit(code)
@@ -1881,11 +1853,7 @@ Examples:
   git stack diff -- src/""")
 
     current = get_current_branch()
-    base = get_stack_base(current)
-
-    if not base:
-        print("Current branch is not stacked")
-        sys.exit(1)
+    base = require_stacked(current)
 
     code = git_run('diff', base, *args)
     sys.exit(code)
