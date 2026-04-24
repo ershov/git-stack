@@ -1101,76 +1101,93 @@ Examples:
 
 
 def cmd_sync1(args: List[str], git_root: Path, state: SyncState) -> None:
-    """Sync current branch with its immediate upstream."""
+    """Sync current (or specified) branch with its immediate upstream."""
     if has_help_flag(args):
         print_cmd_help("""\
-Usage: git stack s1|sync1
+Usage: git stack s1|sync1 [branch]
 
-Rebase the current branch onto the latest tip of its immediate parent.
-Does not sync any ancestor branches first.
+Rebase the current branch (or the specified branch) onto the latest
+tip of its immediate parent. Does not sync any ancestor branches first.
+
+Arguments:
+  [branch]    Branch to sync; default: current branch
 
 If conflicts occur, resolve them and run:
   git stack continue""")
 
     check_no_sync_in_progress(state)
 
-    current = get_current_branch()
-    base = get_stack_base(current)
+    original = get_current_branch()
+    target = args[0] if args else original
 
+    base = get_stack_base(target)
     if not base:
-        print("Current branch is not stacked")
+        print(f"Branch '{target}' is not stacked")
         sys.exit(1)
 
     # Use state management for continue/abort support
-    state.init(current, [current])
+    state.init(original, [target])
 
-    if not sync_single_branch(current, state, git_root):
+    if not sync_single_branch(target, state, git_root):
+        git('checkout', original, check=False)
         sys.exit(1)
 
     state.cleanup()
+    git('checkout', original)
     print("Sync complete.")
 
 
 def cmd_sync(args: List[str], git_root: Path, state: SyncState) -> None:
-    """Sync current branch with all its upstreams."""
+    """Sync current (or specified) branch with all its upstreams."""
     if has_help_flag(args):
         print_cmd_help("""\
-Usage: git stack su|sync-up
+Usage: git stack su|sync-up [branch]
 
-Recursively sync the current branch and all its ancestors.
-Syncs in dependency order: ancestors first, then the current branch.
+Recursively sync the current branch (or the specified branch) and all
+its ancestors. Syncs in dependency order: ancestors first, then the
+target branch.
+
+Arguments:
+  [branch]    Branch to sync; default: current branch
 
 If conflicts occur at any step, resolve them and run:
   git stack continue""")
 
     check_no_sync_in_progress(state)
 
-    current = get_current_branch()
-    branches = get_branches_in_dependency_order(current)
+    original = get_current_branch()
+    target = args[0] if args else original
+
+    branches = get_branches_in_dependency_order(target)
 
     if not branches:
-        print("Current branch is not stacked")
+        print(f"Branch '{target}' is not stacked")
         sys.exit(1)
 
-    state.init(current, branches)
+    state.init(original, branches)
 
     for branch in branches:
         if not sync_single_branch(branch, state, git_root):
+            git('checkout', original, check=False)
             sys.exit(1)
 
     state.cleanup()
+    git('checkout', original)
     print("Sync complete.")
 
 
 def cmd_sync_deps(args: List[str], git_root: Path, state: SyncState) -> None:
-    """Sync dependants (descendants) of the current branch."""
+    """Sync dependants (descendants) of the current (or specified) branch."""
     if has_help_flag(args):
         print_cmd_help("""\
-Usage: git stack sd|sync-deps
+Usage: git stack sd|sync-deps [branch]
 
 Sync all branches that depend on (are descendants of) the current
-branch, but NOT the current branch itself. Useful after amending or
-force-pushing the current branch to cascade the change downward.
+branch (or the specified branch), but NOT the branch itself. Useful
+after amending or force-pushing a branch to cascade the change downward.
+
+Arguments:
+  [branch]    Branch whose descendants to sync; default: current branch
 
 Syncs in dependency order: direct children first, then grandchildren.
 
@@ -1179,23 +1196,24 @@ If conflicts occur, resolve them and run:
 
     check_no_sync_in_progress(state)
 
-    current = get_current_branch()
+    original = get_current_branch()
+    target = args[0] if args else original
 
-    branches = get_descendants_in_dependency_order(current)
+    branches = get_descendants_in_dependency_order(target)
 
     if not branches:
-        print("No dependants to sync.")
+        print(f"No dependants to sync for '{target}'.")
         return
 
-    state.init(current, branches)
+    state.init(original, branches)
 
     for branch in branches:
         if not sync_single_branch(branch, state, git_root):
-            git('checkout', current, check=False)
+            git('checkout', original, check=False)
             sys.exit(1)
 
     state.cleanup()
-    git('checkout', current)
+    git('checkout', original)
     print("Sync complete.")
 
 
